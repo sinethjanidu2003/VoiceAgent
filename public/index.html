@@ -210,6 +210,7 @@
       };
       monitorWs.onmessage = (e) => {
         if (e.data instanceof ArrayBuffer) {
+          console.log("Received PCM data", e.data);
           playPcmChunk(e.data);
           return;
         }
