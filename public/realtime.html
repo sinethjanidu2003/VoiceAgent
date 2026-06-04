@@ -3,13 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Streaming Voice — Talk in Browser</title>
+  <title>Talk in Browser — Built-in Voice</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; background: #111; color: #eee; }
     h1 { font-size: 1.3rem; }
     .card { background: #1e1e1e; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
     button { padding: 0.6rem 1.2rem; font-size: 1rem; cursor: pointer; margin-right: 0.5rem; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
+    select { padding: 0.4rem; font-size: 1rem; max-width: 100%; margin-top: 0.5rem; }
     .flow { color: #a78bfa; font-size: 0.85rem; }
     .live { color: #86efac; }
     .error { color: #f87171; }
@@ -18,24 +19,41 @@
     .assistant { color: #86efac; }
     #liveReply { color: #86efac; min-height: 1.2rem; margin-top: 0.5rem; font-style: italic; }
     a { color: #93c5fd; }
+    label { display: block; margin: 0.75rem 0 0.25rem; }
   </style>
 </head>
 <body>
-  <h1>Talk in Browser (Streaming)</h1>
-  <p class="flow">Mic → Whisper → ChatGPT (streaming text) → browser voice (Web Speech API)</p>
+  <h1>Talk in Browser</h1>
+  <p class="flow">
+    Uses your computer's <strong>built-in voice</strong> (Web Speech API) — free, no OpenAI TTS.
+    <br />Mic → Whisper → ChatGPT → browser speaks the reply.
+  </p>
   <p><a href="/">← Back to phone agent</a></p>
 
   <div class="card">
+    <label for="voiceSelect">Built-in voice</label>
+    <select id="voiceSelect"><option>Loading voices…</option></select>
+
+    <br /><br />
     <button id="connectBtn">Connect &amp; talk</button>
     <button id="stopBtn" disabled>Disconnect</button>
-    <p id="status" class="flow">Uses your browser's built-in voice — no Realtime API needed.</p>
+    <p id="status" class="flow">Chrome or Edge recommended.</p>
     <div id="liveReply"></div>
     <div id="log"></div>
   </div>
 
-  <script>
+  <script type="module">
+    import {
+      initBrowserTts,
+      setBrowserVoice,
+      speakBrowser,
+      stopBrowserTts,
+      isBrowserTtsSupported,
+    } from "./browser-tts.js";
+
     const connectBtn = document.getElementById("connectBtn");
     const stopBtn = document.getElementById("stopBtn");
+    const voiceSelect = document.getElementById("voiceSelect");
     const status = document.getElementById("status");
     const liveReply = document.getElementById("liveReply");
     const log = document.getElementById("log");
@@ -45,39 +63,10 @@
     let micStream = null;
     let micContext = null;
     let micProcessor = null;
-    let speaking = false;
 
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       return `${proto}//${location.host}/realtime-talk`;
-    }
-
-    function pickVoice() {
-      const voices = speechSynthesis.getVoices();
-      return (
-        voices.find((v) => v.lang.startsWith("en") && v.localService) ||
-        voices.find((v) => v.lang.startsWith("en")) ||
-        voices[0]
-      );
-    }
-
-    function stopSpeaking() {
-      speechSynthesis.cancel();
-      speaking = false;
-    }
-
-    function speak(text) {
-      stopSpeaking();
-      if (!text?.trim()) return;
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.voice = pickVoice();
-      utter.rate = 1;
-      utter.pitch = 1;
-      speaking = true;
-      utter.onend = () => {
-        speaking = false;
-      };
-      speechSynthesis.speak(utter);
     }
 
     function addLine(role, text) {
@@ -87,6 +76,19 @@
       log.appendChild(div);
       log.scrollTop = log.scrollHeight;
     }
+
+    async function populateVoices() {
+      const voices = await initBrowserTts("en");
+      voiceSelect.innerHTML = voices
+        .filter((v) => v.lang.startsWith("en"))
+        .map((v) => `<option value="${v.voiceURI}">${v.name} (${v.lang})</option>`)
+        .join("");
+      if (!voiceSelect.options.length) {
+        voiceSelect.innerHTML = '<option value="">Default system voice</option>';
+      }
+    }
+
+    voiceSelect.onchange = () => setBrowserVoice(voiceSelect.value);
 
     async function startMic() {
       micStream = await navigator.mediaDevices.getUserMedia({
@@ -123,7 +125,7 @@
     }
 
     function disconnect() {
-      stopSpeaking();
+      stopBrowserTts();
       stopMic();
       ws?.close();
       ws = null;
@@ -134,15 +136,16 @@
       status.className = "flow";
     }
 
-    speechSynthesis.onvoiceschanged = () => pickVoice();
+    populateVoices();
 
     connectBtn.onclick = async () => {
       try {
-        if (!("speechSynthesis" in window)) {
-          status.textContent = "Browser speech not supported. Try Chrome or Edge.";
+        if (!isBrowserTtsSupported()) {
+          status.textContent = "Built-in speech not supported. Use Chrome or Edge.";
           status.className = "error";
           return;
         }
+        setBrowserVoice(voiceSelect.value);
         status.textContent = "Connecting…";
         ws = new WebSocket(wsUrl());
 
@@ -154,7 +157,7 @@
         ws.onmessage = (event) => {
           const msg = JSON.parse(event.data);
           if (msg.type === "ready") {
-            status.textContent = "Connected — speak, then pause. AI replies with browser voice.";
+            status.textContent = "Connected — speak, then pause ~1.5s. Built-in voice will reply.";
             status.className = "live";
             connectBtn.disabled = true;
             stopBtn.disabled = false;
@@ -164,9 +167,9 @@
           } else if (msg.type === "token") {
             liveReply.textContent += msg.text;
           } else if (msg.type === "speak") {
-            speak(msg.text);
+            speakBrowser(msg.text);
           } else if (msg.type === "interrupt") {
-            stopSpeaking();
+            stopBrowserTts();
           } else if (msg.type === "error") {
             status.textContent = msg.message;
             status.className = "error";

@@ -146,6 +146,7 @@ function startStreamingSession(callConnectionId) {
     sampleRate: SAMPLE_RATE,
     silenceMs: SILENCE_MS,
     minPcmBytes: MIN_PCM_BYTES,
+    speakMode: "openai",
     onReady: () => {
       console.log(`[${callConnectionId}] Streaming session ready`);
       session.mode = "listening";
@@ -659,6 +660,7 @@ realtimeWss.on("connection", (ws) => {
     sampleRate: SAMPLE_RATE,
     silenceMs: SILENCE_MS,
     minPcmBytes: MIN_PCM_BYTES,
+    speakMode: "browser",
     onReady: () => {
       ws.send(JSON.stringify({ type: "ready" }));
       session.requestGreeting();
@@ -674,7 +676,7 @@ realtimeWss.on("connection", (ws) => {
       logTranscript(browserId, "assistant", text);
       ws.send(JSON.stringify({ type: "transcript", role: "assistant", text }));
     },
-    onSpeak: (text) => {
+    onSpeakSentence: (text) => {
       ws.send(JSON.stringify({ type: "speak", text }));
     },
     onInterrupt: () => {

@@ -24,16 +24,16 @@
 <body>
   <h1>Phone Voice Agent</h1>
   <p class="flow">
-    Default: streaming AI on phone calls.
-    <a href="/realtime.html">Test talk in browser first →</a>
+    Phone calls use OpenAI TTS for the caller.
+    <a href="/realtime.html">Talk in browser with built-in voice (free) →</a>
   </p>
 
   <div class="card">
     <label>Call this number:</label>
     <input id="phone" type="tel" placeholder="+15551234567" />
     <br />
-    <label><input type="radio" name="callMode" value="stream" checked /> Streaming AI (Whisper → ChatGPT → voice)</label>
-    <label><input type="radio" name="callMode" value="ai" /> Batch AI (Whisper → ChatGPT → TTS)</label>
+    <label><input type="radio" name="callMode" value="stream" checked /> Streaming AI on phone (OpenAI TTS for caller)</label>
+    <label><input type="radio" name="callMode" value="ai" /> Batch AI on phone</label>
     <label><input type="radio" name="callMode" value="live" /> Live — you talk from browser (no AI)</label>
     <br />
     <button id="callBtn">Start call</button>
