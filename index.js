@@ -52,6 +52,24 @@ function getMonitorSet(callConnectionId) {
   return browserMonitors.get(callConnectionId);
 }
 
+function hasMonitorListeners(callConnectionId) {
+  return (browserMonitors.get(callConnectionId)?.size ?? 0) > 0;
+}
+
+function notifyMonitorTranscript(callConnectionId, role, text) {
+  const monitors = browserMonitors.get(callConnectionId);
+  if (!monitors?.size) return;
+  const payload = JSON.stringify({
+    type: "transcript",
+    role,
+    text,
+    time: new Date().toISOString(),
+  });
+  for (const client of monitors) {
+    if (client.readyState === 1) client.send(payload);
+  }
+}
+
 function broadcastPhoneAudio(callConnectionId, pcmBuffer) {
   const monitors = browserMonitors.get(callConnectionId);
   if (!monitors?.size) return;
@@ -98,6 +116,7 @@ function logTranscript(callConnectionId, role, text) {
   });
   if (transcriptLog.length > MAX_LOG) transcriptLog.shift();
   console.log(`[${role}] ${text}`);
+  notifyMonitorTranscript(callConnectionId, role, text);
 }
 
 function normalizePhone(phone) {
@@ -156,7 +175,11 @@ function startStreamingSession(callConnectionId) {
         session.streaming.requestGreeting();
       }
     },
-    onUserTranscript: (text) => logTranscript(callConnectionId, "user", text),
+    onUserTranscript: (text) => {
+      if (!hasMonitorListeners(callConnectionId)) {
+        logTranscript(callConnectionId, "user", text);
+      }
+    },
     onAssistantText: (text) => logTranscript(callConnectionId, "assistant", text),
     onSpeak: (text) => {
       session.mode = "playing";
@@ -212,6 +235,10 @@ function getSession(callConnectionId) {
       greeted: false,
       streamingGreeted: false,
       streaming: null,
+      monitorAudioChunks: [],
+      monitorHadSpeech: false,
+      monitorLastSpeechAt: 0,
+      monitorIsTranscribing: false,
       messages: [{ role: "system", content: SYSTEM_PROMPT }],
     });
   }
@@ -341,7 +368,9 @@ async function processUserAudio(callConnectionId) {
     }
 
     session.silenceRetries = 2;
-    logTranscript(callConnectionId, "user", text);
+    if (!hasMonitorListeners(callConnectionId)) {
+      logTranscript(callConnectionId, "user", text);
+    }
 
     if (wantsGoodbye(text)) {
       logTranscript(callConnectionId, "assistant", GOODBYE);
@@ -360,12 +389,53 @@ async function processUserAudio(callConnectionId) {
   }
 }
 
+function maybeFlushMonitorTranscript(callConnectionId) {
+  const session = getSession(callConnectionId);
+  if (!hasMonitorListeners(callConnectionId)) return;
+  if (session.monitorIsTranscribing || !session.monitorHadSpeech) return;
+  if (!session.monitorAudioChunks.length) return;
+  if (Date.now() - session.monitorLastSpeechAt < SILENCE_MS) return;
+
+  processMonitorTranscript(callConnectionId).catch((err) =>
+    console.error("Monitor transcript:", err.message)
+  );
+}
+
+async function processMonitorTranscript(callConnectionId) {
+  const session = getSession(callConnectionId);
+  if (session.monitorIsTranscribing) return;
+
+  const pcm = Buffer.concat(session.monitorAudioChunks);
+  session.monitorAudioChunks = [];
+  session.monitorHadSpeech = false;
+
+  if (pcm.length < MIN_PCM_BYTES) return;
+
+  session.monitorIsTranscribing = true;
+  try {
+    const text = await transcribePcm(pcm);
+    if (text) {
+      console.log(`[${callConnectionId}] Caller (monitor): "${text}"`);
+      logTranscript(callConnectionId, "user", text);
+    }
+  } finally {
+    session.monitorIsTranscribing = false;
+  }
+}
+
 function onAudioPacket(callConnectionId, base64) {
   const session = getSession(callConnectionId);
   const buf = Buffer.from(base64, "base64");
   if (!buf.length) return;
 
   broadcastPhoneAudio(callConnectionId, buf);
+
+  if (hasMonitorListeners(callConnectionId)) {
+    session.monitorAudioChunks.push(buf);
+    session.monitorLastSpeechAt = Date.now();
+    session.monitorHadSpeech = true;
+    maybeFlushMonitorTranscript(callConnectionId);
+  }
 
   if (session.callMode === "stream") {
     session.streaming?.appendAudio16k(buf);

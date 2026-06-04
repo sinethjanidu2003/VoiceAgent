@@ -47,6 +47,9 @@
 
   <div class="card">
     <strong>Live transcript</strong>
+    <p class="system" style="font-size:0.85rem;margin:0 0 0.5rem">
+      When you join a call, the caller's speech is transcribed here (Whisper).
+    </p>
     <div id="log"></div>
   </div>
 
@@ -165,6 +168,33 @@
       nextPlayTime = 0;
     }
 
+    function appendTranscriptLine(entry) {
+      const time = entry.time?.slice(11, 19) || new Date().toISOString().slice(11, 19);
+      log.insertAdjacentHTML(
+        "beforeend",
+        `<div class="${entry.role}"><small>${time}</small> ` +
+          `<b>${entry.role}:</b> ${entry.text}</div>`
+      );
+      log.scrollTop = log.scrollHeight;
+    }
+
+    async function reloadTranscript() {
+      const res = await fetch("/api/transcript");
+      const lines = await res.json();
+      const forCall = callConnectionId
+        ? lines.filter((e) => e.callConnectionId === callConnectionId)
+        : lines;
+      lastCount = forCall.length;
+      log.innerHTML = forCall
+        .map(
+          (e) =>
+            `<div class="${e.role}"><small>${e.time.slice(11, 19)}</small> ` +
+            `<b>${e.role}:</b> ${e.text}</div>`
+        )
+        .join("");
+      log.scrollTop = log.scrollHeight;
+    }
+
     function joinMonitor() {
       if (!callConnectionId) return;
       disconnectMonitor();
@@ -176,9 +206,19 @@
         takeoverBtn.disabled = false;
         streamBtn.disabled = false;
         aiBtn.disabled = false;
+        reloadTranscript();
       };
       monitorWs.onmessage = (e) => {
-        if (e.data instanceof ArrayBuffer) playPcmChunk(e.data);
+        if (e.data instanceof ArrayBuffer) {
+          playPcmChunk(e.data);
+          return;
+        }
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === "transcript") appendTranscriptLine(msg);
+        } catch {
+          /* ignore */
+        }
       };
       monitorWs.onclose = () => {
         joinBtn.disabled = !callConnectionId;
@@ -228,9 +268,12 @@
     setInterval(async () => {
       const res = await fetch("/api/transcript");
       const lines = await res.json();
-      if (lines.length === lastCount) return;
-      lastCount = lines.length;
-      log.innerHTML = lines
+      const forCall = callConnectionId
+        ? lines.filter((e) => e.callConnectionId === callConnectionId)
+        : lines;
+      if (forCall.length === lastCount) return;
+      lastCount = forCall.length;
+      log.innerHTML = forCall
         .map(
           (e) =>
             `<div class="${e.role}"><small>${e.time.slice(11, 19)}</small> ` +
