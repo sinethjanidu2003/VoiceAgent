@@ -9,8 +9,7 @@ import { v4 as uuidv4 } from "uuid";
 import OpenAI, { toFile } from "openai";
 import { CallAutomationClient, StreamingData, createOutboundAudioData, createOutboundStopAudioData } from "@azure/communication-call-automation";
 import { pcm16ToWav } from "./lib/wav.js";
-import { resample24kTo16k } from "./lib/audioResample.js";
-import { createRealtimeBridge } from "./lib/realtimeBridge.js";
+import { createStreamingSession } from "./lib/streamingSession.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUDIO_DIR = path.join(__dirname, "tmp", "audio");
@@ -29,9 +28,6 @@ const config = {
   openAiKey: process.env.OPENAI_API_KEY?.trim(),
   chatModel: process.env.OPENAI_CHAT_MODEL?.trim() || "gpt-4o-mini",
   ttsVoice: process.env.OPENAI_TTS_VOICE?.trim() || "nova",
-  realtimeModel:
-    process.env.OPENAI_REALTIME_MODEL?.trim() || "gpt-4o-mini-realtime-preview",
-  realtimeVoice: process.env.OPENAI_REALTIME_VOICE?.trim() || "alloy",
 };
 
 /** @type {CallAutomationClient | null} */
@@ -128,48 +124,58 @@ function validateConfig() {
 }
 
 function initClients() {
-  if (!validateConfig()) return;
-  acsClient = new CallAutomationClient(config.connectionString);
-  openai = new OpenAI({ apiKey: config.openAiKey });
-  console.log("Ready: phone → OpenAI Realtime / batch AI / browser live");
+  if (config.openAiKey) {
+    openai = new OpenAI({ apiKey: config.openAiKey });
+    console.log("OpenAI ready (Whisper + ChatGPT streaming + browser TTS)");
+  }
+  if (validateConfig()) {
+    acsClient = new CallAutomationClient(config.connectionString);
+    console.log("ACS ready for phone calls");
+  }
 }
 
-async function startRealtimeBridge(callConnectionId) {
+function startStreamingSession(callConnectionId) {
   const session = getSession(callConnectionId);
-  if (session.realtime) return session.realtime;
+  if (session.streaming) return session.streaming;
 
-  session.realtime = await createRealtimeBridge({
+  session.streaming = createStreamingSession({
     openai,
-    model: config.realtimeModel,
-    voice: config.realtimeVoice,
-    instructions: SYSTEM_PROMPT,
+    chatModel: config.chatModel,
+    systemPrompt: SYSTEM_PROMPT,
+    greetingText: HELLO,
+    sampleRate: SAMPLE_RATE,
+    silenceMs: SILENCE_MS,
+    minPcmBytes: MIN_PCM_BYTES,
     onReady: () => {
-      console.log(`[${callConnectionId}] OpenAI Realtime ready`);
-      session.mode = "realtime";
-      if (!session.realtimeGreeted) {
-        session.realtimeGreeted = true;
-        logTranscript(callConnectionId, "system", "Realtime AI connected");
-        session.realtime.requestGreeting();
+      console.log(`[${callConnectionId}] Streaming session ready`);
+      session.mode = "listening";
+      if (!session.streamingGreeted) {
+        session.streamingGreeted = true;
+        logTranscript(callConnectionId, "system", "Streaming AI connected");
+        session.streaming.requestGreeting();
       }
     },
-    onAudio24: (pcm24) => {
-      sendAudioToPhone(callConnectionId, resample24kTo16k(pcm24));
-    },
     onUserTranscript: (text) => logTranscript(callConnectionId, "user", text),
-    onAssistantTranscript: (text) => logTranscript(callConnectionId, "assistant", text),
-    onSpeechStarted: () => stopPhonePlayback(callConnectionId),
-    onError: (err) => console.error(`[${callConnectionId}] Realtime:`, err.message),
+    onAssistantText: (text) => logTranscript(callConnectionId, "assistant", text),
+    onSpeak: (text) => {
+      session.mode = "playing";
+      speakOnPhone(callConnectionId, text, "Stream").catch((err) =>
+        console.error("Stream TTS:", err.message)
+      );
+    },
+    onInterrupt: () => stopPhonePlayback(callConnectionId),
+    onError: (err) => console.error(`[${callConnectionId}] Stream:`, err.message),
   });
 
-  return session.realtime;
+  return session.streaming;
 }
 
-function stopRealtimeBridge(callConnectionId) {
+function stopStreamingSession(callConnectionId) {
   const session = callSessions.get(callConnectionId);
-  if (!session?.realtime) return;
-  session.realtime.disconnect();
-  session.realtime = null;
-  session.realtimeGreeted = false;
+  if (!session?.streaming) return;
+  session.streaming.disconnect();
+  session.streaming = null;
+  session.streamingGreeted = false;
 }
 
 function mediaWsUrl() {
@@ -203,8 +209,8 @@ function getSession(callConnectionId) {
       isProcessing: false,
       silenceRetries: 2,
       greeted: false,
-      realtimeGreeted: false,
-      realtime: null,
+      streamingGreeted: false,
+      streaming: null,
       messages: [{ role: "system", content: SYSTEM_PROMPT }],
     });
   }
@@ -216,7 +222,7 @@ function getCallMedia(id) {
 }
 
 async function hangUp(callConnectionId) {
-  stopRealtimeBridge(callConnectionId);
+  stopStreamingSession(callConnectionId);
   callSessions.delete(callConnectionId);
   acsMediaSockets.delete(callConnectionId);
   browserMonitors.delete(callConnectionId);
@@ -360,8 +366,8 @@ function onAudioPacket(callConnectionId, base64) {
 
   broadcastPhoneAudio(callConnectionId, buf);
 
-  if (session.callMode === "realtime") {
-    session.realtime?.appendAudio16k(buf);
+  if (session.callMode === "stream") {
+    session.streaming?.appendAudio16k(buf);
     return;
   }
 
@@ -387,10 +393,8 @@ function onMediaMessage(callConnectionId, packetData) {
       session.mode = "listening";
       return;
     }
-    if (session.callMode === "realtime") {
-      startRealtimeBridge(callConnectionId).catch((err) =>
-        console.error("Realtime start:", err.message)
-      );
+    if (session.callMode === "stream") {
+      startStreamingSession(callConnectionId);
       return;
     }
     if (!session.greeted) {
@@ -430,9 +434,8 @@ function onPlayStarted(callConnectionId, context) {
 app.get("/api/health", (_req, res) => {
   res.json({
     status: validateConfig() ? "ok" : "missing_config",
-    flow: "Phone → OpenAI Realtime (streaming) or batch AI or browser live",
+    flow: "Phone → Whisper → ChatGPT stream → TTS (phone) or browser speech",
     chatModel: config.chatModel,
-    realtimeModel: config.realtimeModel,
   });
 });
 
@@ -446,9 +449,9 @@ app.post("/api/call/:id/mode", async (req, res) => {
   }
 
   const mode =
-    req.body?.mode === "live" ? "live" : req.body?.mode === "realtime" ? "realtime" : "ai";
+    req.body?.mode === "live" ? "live" : req.body?.mode === "stream" ? "stream" : "ai";
 
-  stopRealtimeBridge(callConnectionId);
+  stopStreamingSession(callConnectionId);
   session.callMode = mode;
   session.audioChunks = [];
   session.hadSpeech = false;
@@ -458,15 +461,11 @@ app.post("/api/call/:id/mode", async (req, res) => {
     stopPhonePlayback(callConnectionId);
     session.mode = "listening";
     logTranscript(callConnectionId, "system", "You took over — browser mic is live on the call");
-  } else if (mode === "realtime") {
+  } else if (mode === "stream") {
     stopPhonePlayback(callConnectionId);
-    session.mode = "realtime";
-    try {
-      await startRealtimeBridge(callConnectionId);
-      logTranscript(callConnectionId, "system", "OpenAI Realtime streaming AI active");
-    } catch (err) {
-      return res.status(500).json({ success: false, error: err.message });
-    }
+    session.mode = "listening";
+    startStreamingSession(callConnectionId);
+    logTranscript(callConnectionId, "system", "Streaming AI active (Whisper + ChatGPT)");
   } else {
     session.mode = "listening";
     logTranscript(callConnectionId, "system", "Batch AI assistant resumed");
@@ -510,15 +509,15 @@ app.post("/call", async (req, res) => {
     const callConnectionId = result.callConnection.callConnectionId;
     const session = getSession(callConnectionId);
     const callMode =
-      requestedMode === "live" || requestedMode === "ai" ? requestedMode : "realtime";
+      requestedMode === "live" || requestedMode === "ai" ? requestedMode : "stream";
     session.callMode = callMode;
     if (callMode !== "ai") session.greeted = true;
 
     const modeLabel =
       session.callMode === "live"
         ? "live browser"
-        : session.callMode === "realtime"
-          ? "OpenAI Realtime"
+        : session.callMode === "stream"
+          ? "streaming AI"
           : "batch AI";
 
     logTranscript(callConnectionId, "system", `Calling ${normalized} (${modeLabel})…`);
@@ -561,7 +560,7 @@ app.post("/api/callbacks/:contextId", async (req, res) => {
       session.mode = "listening";
       session.audioChunks = [];
     } else if (type === "Microsoft.Communication.CallDisconnected") {
-      stopRealtimeBridge(callConnectionId);
+      stopStreamingSession(callConnectionId);
       callSessions.delete(callConnectionId);
       acsMediaSockets.delete(callConnectionId);
       browserMonitors.delete(callConnectionId);
@@ -641,62 +640,57 @@ monitorWss.on("connection", (ws, _req, callConnectionId) => {
   });
 });
 
-/** Browser-only: talk to OpenAI Realtime (no phone) — same streaming relay pattern */
+/** Browser talk: mic → Whisper → ChatGPT stream → browser TTS (Web Speech API) */
 realtimeWss.on("connection", (ws) => {
   if (!openai) {
+    ws.send(JSON.stringify({ type: "error", message: "OPENAI_API_KEY missing" }));
     ws.close();
     return;
   }
 
   const browserId = uuidv4().slice(0, 8);
-  console.log("Browser Realtime talk:", browserId);
-  let bridge = null;
+  console.log("Browser streaming talk:", browserId);
 
-  createRealtimeBridge({
+  const session = createStreamingSession({
     openai,
-    model: config.realtimeModel,
-    voice: config.realtimeVoice,
-    instructions: SYSTEM_PROMPT,
+    chatModel: config.chatModel,
+    systemPrompt: SYSTEM_PROMPT,
+    greetingText: HELLO,
+    sampleRate: SAMPLE_RATE,
+    silenceMs: SILENCE_MS,
+    minPcmBytes: MIN_PCM_BYTES,
     onReady: () => {
       ws.send(JSON.stringify({ type: "ready" }));
-      bridge?.requestGreeting();
-    },
-    onAudio24: (pcm24) => {
-      if (ws.readyState === 1) ws.send(pcm24);
+      session.requestGreeting();
     },
     onUserTranscript: (text) => {
       logTranscript(browserId, "user", text);
       ws.send(JSON.stringify({ type: "transcript", role: "user", text }));
     },
-    onAssistantTranscript: (text) => {
+    onAssistantToken: (text) => {
+      ws.send(JSON.stringify({ type: "token", text }));
+    },
+    onAssistantText: (text) => {
       logTranscript(browserId, "assistant", text);
       ws.send(JSON.stringify({ type: "transcript", role: "assistant", text }));
     },
-    onSpeechStarted: () => {
-      ws.send(JSON.stringify({ type: "speech_started" }));
+    onSpeak: (text) => {
+      ws.send(JSON.stringify({ type: "speak", text }));
+    },
+    onInterrupt: () => {
+      ws.send(JSON.stringify({ type: "interrupt" }));
     },
     onError: (err) => {
       ws.send(JSON.stringify({ type: "error", message: err.message }));
     },
-  })
-    .then((b) => {
-      bridge = b;
-    })
-    .catch((err) => {
-      ws.send(JSON.stringify({ type: "error", message: err.message }));
-      ws.close();
-    });
+  });
 
   ws.on("message", (data) => {
-    if (!bridge) return;
     const pcm = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    if (pcm.length) bridge.appendAudio16k(pcm);
+    if (pcm.length) session.appendAudio16k(pcm);
   });
 
-  ws.on("close", () => {
-    bridge?.disconnect();
-    bridge = null;
-  });
+  ws.on("close", () => session.disconnect());
 });
 
 server.listen(PORT, () => {

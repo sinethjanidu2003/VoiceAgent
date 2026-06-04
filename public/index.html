@@ -24,7 +24,7 @@
 <body>
   <h1>Phone Voice Agent</h1>
   <p class="flow">
-    Default: OpenAI Realtime streaming on phone calls.
+    Default: streaming AI on phone calls.
     <a href="/realtime.html">Test talk in browser first →</a>
   </p>
 
@@ -32,14 +32,14 @@
     <label>Call this number:</label>
     <input id="phone" type="tel" placeholder="+15551234567" />
     <br />
-    <label><input type="radio" name="callMode" value="realtime" checked /> OpenAI Realtime AI (streaming, recommended)</label>
+    <label><input type="radio" name="callMode" value="stream" checked /> Streaming AI (Whisper → ChatGPT → voice)</label>
     <label><input type="radio" name="callMode" value="ai" /> Batch AI (Whisper → ChatGPT → TTS)</label>
     <label><input type="radio" name="callMode" value="live" /> Live — you talk from browser (no AI)</label>
     <br />
     <button id="callBtn">Start call</button>
     <button id="joinBtn" disabled>Join call (listen)</button>
     <button id="takeoverBtn" disabled>Take over (speak live)</button>
-    <button id="realtimeBtn" disabled>Use Realtime AI</button>
+    <button id="streamBtn" disabled>Streaming AI</button>
     <button id="aiBtn" disabled>Batch AI</button>
     <p id="status"></p>
     <p id="audioStatus" class="system"></p>
@@ -55,7 +55,7 @@
     const callBtn = document.getElementById("callBtn");
     const joinBtn = document.getElementById("joinBtn");
     const takeoverBtn = document.getElementById("takeoverBtn");
-    const realtimeBtn = document.getElementById("realtimeBtn");
+    const streamBtn = document.getElementById("streamBtn");
     const aiBtn = document.getElementById("aiBtn");
     const status = document.getElementById("status");
     const audioStatus = document.getElementById("audioStatus");
@@ -73,7 +73,7 @@
     const SAMPLE_RATE = 16000;
 
     function selectedCallMode() {
-      return document.querySelector('input[name="callMode"]:checked')?.value || "realtime";
+      return document.querySelector('input[name="callMode"]:checked')?.value || "stream";
     }
 
     function wsBase() {
@@ -95,8 +95,8 @@
       } else {
         stopMic();
         audioStatus.textContent =
-          mode === "realtime"
-            ? "OpenAI Realtime AI is on the call."
+          mode === "stream"
+            ? "Streaming AI is on the call."
             : "Batch AI is handling the call.";
         audioStatus.className = "system";
       }
@@ -174,7 +174,7 @@
         audioStatus.textContent = "Connected — you can hear the phone call.";
         joinBtn.disabled = true;
         takeoverBtn.disabled = false;
-        realtimeBtn.disabled = false;
+        streamBtn.disabled = false;
         aiBtn.disabled = false;
       };
       monitorWs.onmessage = (e) => {
@@ -183,7 +183,7 @@
       monitorWs.onclose = () => {
         joinBtn.disabled = !callConnectionId;
         takeoverBtn.disabled = true;
-        realtimeBtn.disabled = true;
+        streamBtn.disabled = true;
         aiBtn.disabled = true;
       };
     }
@@ -194,7 +194,7 @@
       callConnectionId = null;
       joinBtn.disabled = true;
       takeoverBtn.disabled = true;
-      realtimeBtn.disabled = true;
+      streamBtn.disabled = true;
       aiBtn.disabled = true;
 
       const callMode = selectedCallMode();
@@ -222,7 +222,7 @@
 
     joinBtn.onclick = () => joinMonitor();
     takeoverBtn.onclick = () => setCallMode("live");
-    realtimeBtn.onclick = () => setCallMode("realtime");
+    streamBtn.onclick = () => setCallMode("stream");
     aiBtn.onclick = () => setCallMode("ai");
 
     setInterval(async () => {
