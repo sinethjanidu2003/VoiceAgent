@@ -102,7 +102,7 @@ function stopPhonePlayback(callConnectionId) {
 const transcriptLog = [];
 const MAX_LOG = 200;
 const SAMPLE_RATE = 16000;
-const SILENCE_MS = 1500;
+const SILENCE_MS = 500;
 const MIN_PCM_BYTES = SAMPLE_RATE * 2 * 0.3; // 0.3 sec minimum
 
 const SYSTEM_PROMPT = `You are a friendly phone appointment scheduling assistant.
@@ -236,7 +236,7 @@ function startBrowserAiSession(callConnectionId) {
       logTranscript(
         callConnectionId,
         "system",
-        "Browser AI active — speak on phone, pause ~1.5s, AI replies in your browser"
+        "Browser AI active — speak on phone, pause ~0.5s, AI replies in your browser"
       );
     },
     onThinking: () => sendToMonitors(callConnectionId, { type: "thinking" }),

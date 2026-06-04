@@ -157,7 +157,7 @@
         ws.onmessage = (event) => {
           const msg = JSON.parse(event.data);
           if (msg.type === "ready") {
-            status.textContent = "Connected — speak, then pause ~1.5s. Built-in voice will reply.";
+            status.textContent = "Connected — speak, then pause ~0.5s. Built-in voice will reply.";
             status.className = "live";
             connectBtn.disabled = true;
             stopBtn.disabled = false;
