@@ -17,26 +17,30 @@
     .system { color: #94a3b8; font-style: italic; }
     .flow { color: #a78bfa; font-size: 0.85rem; margin-bottom: 1rem; }
     .live { color: #fbbf24; font-weight: 600; }
-    label { display: block; margin: 0.5rem 0; }
+    label { display: block; margin: 0.35rem 0; }
+    a { color: #93c5fd; }
   </style>
 </head>
 <body>
   <h1>Phone Voice Agent</h1>
-  <p class="flow">Phone ↔ browser live audio, or AI: Whisper → ChatGPT → TTS</p>
+  <p class="flow">
+    Default: OpenAI Realtime streaming on phone calls.
+    <a href="/realtime.html">Test talk in browser first →</a>
+  </p>
 
   <div class="card">
     <label>Call this number:</label>
     <input id="phone" type="tel" placeholder="+15551234567" />
     <br />
-    <label>
-      <input id="liveMode" type="checkbox" />
-      Start in live mode (you talk from browser, no AI greeting)
-    </label>
+    <label><input type="radio" name="callMode" value="realtime" checked /> OpenAI Realtime AI (streaming, recommended)</label>
+    <label><input type="radio" name="callMode" value="ai" /> Batch AI (Whisper → ChatGPT → TTS)</label>
+    <label><input type="radio" name="callMode" value="live" /> Live — you talk from browser (no AI)</label>
     <br />
     <button id="callBtn">Start call</button>
     <button id="joinBtn" disabled>Join call (listen)</button>
     <button id="takeoverBtn" disabled>Take over (speak live)</button>
-    <button id="aiBtn" disabled>Hand back to AI</button>
+    <button id="realtimeBtn" disabled>Use Realtime AI</button>
+    <button id="aiBtn" disabled>Batch AI</button>
     <p id="status"></p>
     <p id="audioStatus" class="system"></p>
   </div>
@@ -48,10 +52,10 @@
 
   <script>
     const phone = document.getElementById("phone");
-    const liveMode = document.getElementById("liveMode");
     const callBtn = document.getElementById("callBtn");
     const joinBtn = document.getElementById("joinBtn");
     const takeoverBtn = document.getElementById("takeoverBtn");
+    const realtimeBtn = document.getElementById("realtimeBtn");
     const aiBtn = document.getElementById("aiBtn");
     const status = document.getElementById("status");
     const audioStatus = document.getElementById("audioStatus");
@@ -68,6 +72,10 @@
 
     const SAMPLE_RATE = 16000;
 
+    function selectedCallMode() {
+      return document.querySelector('input[name="callMode"]:checked')?.value || "realtime";
+    }
+
     function wsBase() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       return `${proto}//${location.host}`;
@@ -82,19 +90,20 @@
       });
       if (mode === "live") {
         await startMic();
-        audioStatus.textContent = "Live — your mic is on the phone call. Use headphones to avoid echo.";
+        audioStatus.textContent = "Live — your mic is on the phone call. Use headphones.";
         audioStatus.className = "live";
       } else {
         stopMic();
-        audioStatus.textContent = "Listening only — AI is handling replies.";
+        audioStatus.textContent =
+          mode === "realtime"
+            ? "OpenAI Realtime AI is on the call."
+            : "Batch AI is handling the call.";
         audioStatus.className = "system";
       }
     }
 
     function ensurePlayContext() {
-      if (!playContext) {
-        playContext = new AudioContext({ sampleRate: SAMPLE_RATE });
-      }
+      if (!playContext) playContext = new AudioContext({ sampleRate: SAMPLE_RATE });
       if (playContext.state === "suspended") playContext.resume();
       return playContext;
     }
@@ -103,18 +112,13 @@
       const ctx = ensurePlayContext();
       const int16 = new Int16Array(arrayBuffer);
       if (!int16.length) return;
-
       const floats = new Float32Array(int16.length);
-      for (let i = 0; i < int16.length; i++) {
-        floats[i] = int16[i] / 32768;
-      }
-
+      for (let i = 0; i < int16.length; i++) floats[i] = int16[i] / 32768;
       const buffer = ctx.createBuffer(1, floats.length, SAMPLE_RATE);
       buffer.copyToChannel(floats, 0);
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       source.connect(ctx.destination);
-
       const now = ctx.currentTime;
       if (nextPlayTime < now) nextPlayTime = now;
       source.start(nextPlayTime);
@@ -130,7 +134,6 @@
       const source = micContext.createMediaStreamSource(micStream);
       micProcessor = micContext.createScriptProcessor(4096, 1, 1);
       const ratio = micContext.sampleRate / SAMPLE_RATE;
-
       micProcessor.onaudioprocess = (event) => {
         if (!monitorWs || monitorWs.readyState !== WebSocket.OPEN) return;
         const input = event.inputBuffer.getChannelData(0);
@@ -142,57 +145,45 @@
         }
         monitorWs.send(pcm.buffer);
       };
-
       source.connect(micProcessor);
       micProcessor.connect(micContext.destination);
     }
 
     function stopMic() {
-      if (micProcessor) {
-        micProcessor.disconnect();
-        micProcessor = null;
-      }
-      if (micContext) {
-        micContext.close();
-        micContext = null;
-      }
-      if (micStream) {
-        micStream.getTracks().forEach((t) => t.stop());
-        micStream = null;
-      }
+      micProcessor?.disconnect();
+      micProcessor = null;
+      micContext?.close();
+      micContext = null;
+      micStream?.getTracks().forEach((t) => t.stop());
+      micStream = null;
     }
 
     function disconnectMonitor() {
       stopMic();
-      if (monitorWs) {
-        monitorWs.close();
-        monitorWs = null;
-      }
+      monitorWs?.close();
+      monitorWs = null;
       nextPlayTime = 0;
     }
 
     function joinMonitor() {
       if (!callConnectionId) return;
       disconnectMonitor();
-
       monitorWs = new WebSocket(`${wsBase()}/monitor?callConnectionId=${callConnectionId}`);
       monitorWs.binaryType = "arraybuffer";
-
       monitorWs.onopen = () => {
         audioStatus.textContent = "Connected — you can hear the phone call.";
         joinBtn.disabled = true;
         takeoverBtn.disabled = false;
+        realtimeBtn.disabled = false;
         aiBtn.disabled = false;
       };
-
-      monitorWs.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) playPcmChunk(event.data);
+      monitorWs.onmessage = (e) => {
+        if (e.data instanceof ArrayBuffer) playPcmChunk(e.data);
       };
-
       monitorWs.onclose = () => {
-        audioStatus.textContent = "Disconnected from call audio.";
         joinBtn.disabled = !callConnectionId;
         takeoverBtn.disabled = true;
+        realtimeBtn.disabled = true;
         aiBtn.disabled = true;
       };
     }
@@ -203,12 +194,14 @@
       callConnectionId = null;
       joinBtn.disabled = true;
       takeoverBtn.disabled = true;
+      realtimeBtn.disabled = true;
       aiBtn.disabled = true;
 
+      const callMode = selectedCallMode();
       const res = await fetch("/call", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ toPhone: phone.value, liveMode: liveMode.checked }),
+        body: JSON.stringify({ toPhone: phone.value, callMode }),
       });
       const data = await res.json();
       if (!data.success) {
@@ -217,10 +210,10 @@
       }
 
       callConnectionId = data.callConnectionId;
-      status.textContent = `Call started (${callConnectionId})`;
+      status.textContent = `Call started (${callConnectionId}) — mode: ${data.callMode}`;
       joinBtn.disabled = false;
 
-      if (data.callMode === "live") {
+      if (callMode === "live") {
         joinMonitor();
         await setCallMode("live");
         takeoverBtn.disabled = true;
@@ -228,14 +221,9 @@
     };
 
     joinBtn.onclick = () => joinMonitor();
-
-    takeoverBtn.onclick = async () => {
-      await setCallMode("live");
-    };
-
-    aiBtn.onclick = async () => {
-      await setCallMode("ai");
-    };
+    takeoverBtn.onclick = () => setCallMode("live");
+    realtimeBtn.onclick = () => setCallMode("realtime");
+    aiBtn.onclick = () => setCallMode("ai");
 
     setInterval(async () => {
       const res = await fetch("/api/transcript");

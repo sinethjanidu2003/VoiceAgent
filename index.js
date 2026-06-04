@@ -9,6 +9,8 @@ import { v4 as uuidv4 } from "uuid";
 import OpenAI, { toFile } from "openai";
 import { CallAutomationClient, StreamingData, createOutboundAudioData, createOutboundStopAudioData } from "@azure/communication-call-automation";
 import { pcm16ToWav } from "./lib/wav.js";
+import { resample24kTo16k } from "./lib/audioResample.js";
+import { createRealtimeBridge } from "./lib/realtimeBridge.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUDIO_DIR = path.join(__dirname, "tmp", "audio");
@@ -27,6 +29,9 @@ const config = {
   openAiKey: process.env.OPENAI_API_KEY?.trim(),
   chatModel: process.env.OPENAI_CHAT_MODEL?.trim() || "gpt-4o-mini",
   ttsVoice: process.env.OPENAI_TTS_VOICE?.trim() || "nova",
+  realtimeModel:
+    process.env.OPENAI_REALTIME_MODEL?.trim() || "gpt-4o-mini-realtime-preview",
+  realtimeVoice: process.env.OPENAI_REALTIME_VOICE?.trim() || "alloy",
 };
 
 /** @type {CallAutomationClient | null} */
@@ -126,7 +131,45 @@ function initClients() {
   if (!validateConfig()) return;
   acsClient = new CallAutomationClient(config.connectionString);
   openai = new OpenAI({ apiKey: config.openAiKey });
-  console.log("Ready: phone → Whisper → ChatGPT → OpenAI TTS (public API)");
+  console.log("Ready: phone → OpenAI Realtime / batch AI / browser live");
+}
+
+async function startRealtimeBridge(callConnectionId) {
+  const session = getSession(callConnectionId);
+  if (session.realtime) return session.realtime;
+
+  session.realtime = await createRealtimeBridge({
+    openai,
+    model: config.realtimeModel,
+    voice: config.realtimeVoice,
+    instructions: SYSTEM_PROMPT,
+    onReady: () => {
+      console.log(`[${callConnectionId}] OpenAI Realtime ready`);
+      session.mode = "realtime";
+      if (!session.realtimeGreeted) {
+        session.realtimeGreeted = true;
+        logTranscript(callConnectionId, "system", "Realtime AI connected");
+        session.realtime.requestGreeting();
+      }
+    },
+    onAudio24: (pcm24) => {
+      sendAudioToPhone(callConnectionId, resample24kTo16k(pcm24));
+    },
+    onUserTranscript: (text) => logTranscript(callConnectionId, "user", text),
+    onAssistantTranscript: (text) => logTranscript(callConnectionId, "assistant", text),
+    onSpeechStarted: () => stopPhonePlayback(callConnectionId),
+    onError: (err) => console.error(`[${callConnectionId}] Realtime:`, err.message),
+  });
+
+  return session.realtime;
+}
+
+function stopRealtimeBridge(callConnectionId) {
+  const session = callSessions.get(callConnectionId);
+  if (!session?.realtime) return;
+  session.realtime.disconnect();
+  session.realtime = null;
+  session.realtimeGreeted = false;
 }
 
 function mediaWsUrl() {
@@ -160,6 +203,8 @@ function getSession(callConnectionId) {
       isProcessing: false,
       silenceRetries: 2,
       greeted: false,
+      realtimeGreeted: false,
+      realtime: null,
       messages: [{ role: "system", content: SYSTEM_PROMPT }],
     });
   }
@@ -171,6 +216,7 @@ function getCallMedia(id) {
 }
 
 async function hangUp(callConnectionId) {
+  stopRealtimeBridge(callConnectionId);
   callSessions.delete(callConnectionId);
   acsMediaSockets.delete(callConnectionId);
   browserMonitors.delete(callConnectionId);
@@ -314,6 +360,11 @@ function onAudioPacket(callConnectionId, base64) {
 
   broadcastPhoneAudio(callConnectionId, buf);
 
+  if (session.callMode === "realtime") {
+    session.realtime?.appendAudio16k(buf);
+    return;
+  }
+
   if (session.callMode === "live") return;
   if (session.mode !== "listening" || session.isProcessing) return;
 
@@ -334,6 +385,12 @@ function onMediaMessage(callConnectionId, packetData) {
     if (session.callMode === "live") {
       logTranscript(callConnectionId, "system", "Live mode — speak from your browser");
       session.mode = "listening";
+      return;
+    }
+    if (session.callMode === "realtime") {
+      startRealtimeBridge(callConnectionId).catch((err) =>
+        console.error("Realtime start:", err.message)
+      );
       return;
     }
     if (!session.greeted) {
@@ -373,21 +430,25 @@ function onPlayStarted(callConnectionId, context) {
 app.get("/api/health", (_req, res) => {
   res.json({
     status: validateConfig() ? "ok" : "missing_config",
-    flow: "Phone → Whisper (OpenAI) → ChatGPT (OpenAI) → TTS (OpenAI) → Phone",
+    flow: "Phone → OpenAI Realtime (streaming) or batch AI or browser live",
     chatModel: config.chatModel,
+    realtimeModel: config.realtimeModel,
   });
 });
 
 app.get("/api/transcript", (_req, res) => res.json(transcriptLog));
 
-app.post("/api/call/:id/mode", (req, res) => {
+app.post("/api/call/:id/mode", async (req, res) => {
   const callConnectionId = req.params.id;
   const session = callSessions.get(callConnectionId);
   if (!session) {
     return res.status(404).json({ success: false, error: "Call not found" });
   }
 
-  const mode = req.body?.mode === "live" ? "live" : "ai";
+  const mode =
+    req.body?.mode === "live" ? "live" : req.body?.mode === "realtime" ? "realtime" : "ai";
+
+  stopRealtimeBridge(callConnectionId);
   session.callMode = mode;
   session.audioChunks = [];
   session.hadSpeech = false;
@@ -397,9 +458,18 @@ app.post("/api/call/:id/mode", (req, res) => {
     stopPhonePlayback(callConnectionId);
     session.mode = "listening";
     logTranscript(callConnectionId, "system", "You took over — browser mic is live on the call");
+  } else if (mode === "realtime") {
+    stopPhonePlayback(callConnectionId);
+    session.mode = "realtime";
+    try {
+      await startRealtimeBridge(callConnectionId);
+      logTranscript(callConnectionId, "system", "OpenAI Realtime streaming AI active");
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
   } else {
     session.mode = "listening";
-    logTranscript(callConnectionId, "system", "AI assistant resumed");
+    logTranscript(callConnectionId, "system", "Batch AI assistant resumed");
   }
 
   res.json({ success: true, mode });
@@ -411,7 +481,7 @@ app.post("/call", async (req, res) => {
   }
 
   try {
-    const { toPhone, liveMode } = req.body;
+    const { toPhone, callMode: requestedMode } = req.body;
     if (!toPhone) return res.status(400).json({ success: false, error: "toPhone required" });
 
     if (!config.fromPhone) {
@@ -439,14 +509,19 @@ app.post("/call", async (req, res) => {
 
     const callConnectionId = result.callConnection.callConnectionId;
     const session = getSession(callConnectionId);
-    session.callMode = liveMode ? "live" : "ai";
-    if (liveMode) session.greeted = true;
+    const callMode =
+      requestedMode === "live" || requestedMode === "ai" ? requestedMode : "realtime";
+    session.callMode = callMode;
+    if (callMode !== "ai") session.greeted = true;
 
-    logTranscript(
-      callConnectionId,
-      "system",
-      liveMode ? `Calling ${normalized} (live browser mode)…` : `Calling ${normalized}…`
-    );
+    const modeLabel =
+      session.callMode === "live"
+        ? "live browser"
+        : session.callMode === "realtime"
+          ? "OpenAI Realtime"
+          : "batch AI";
+
+    logTranscript(callConnectionId, "system", `Calling ${normalized} (${modeLabel})…`);
 
     res.json({ success: true, callConnectionId, toPhone: normalized, callMode: session.callMode });
   } catch (err) {
@@ -486,6 +561,7 @@ app.post("/api/callbacks/:contextId", async (req, res) => {
       session.mode = "listening";
       session.audioChunks = [];
     } else if (type === "Microsoft.Communication.CallDisconnected") {
+      stopRealtimeBridge(callConnectionId);
       callSessions.delete(callConnectionId);
       acsMediaSockets.delete(callConnectionId);
       browserMonitors.delete(callConnectionId);
@@ -510,6 +586,7 @@ app.delete("/hangup/:id", async (req, res) => {
 const server = http.createServer(app);
 const mediaWss = new WebSocketServer({ noServer: true });
 const monitorWss = new WebSocketServer({ noServer: true });
+const realtimeWss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
   const { pathname, searchParams } = new URL(req.url, `http://${req.headers.host}`);
@@ -519,6 +596,8 @@ server.on("upgrade", (req, socket, head) => {
     monitorWss.handleUpgrade(req, socket, head, (ws) =>
       monitorWss.emit("connection", ws, req, searchParams.get("callConnectionId"))
     );
+  } else if (pathname === "/realtime-talk") {
+    realtimeWss.handleUpgrade(req, socket, head, (ws) => realtimeWss.emit("connection", ws));
   } else {
     socket.destroy();
   }
@@ -559,6 +638,64 @@ monitorWss.on("connection", (ws, _req, callConnectionId) => {
   });
   ws.on("close", () => {
     getMonitorSet(callConnectionId).delete(ws);
+  });
+});
+
+/** Browser-only: talk to OpenAI Realtime (no phone) — same streaming relay pattern */
+realtimeWss.on("connection", (ws) => {
+  if (!openai) {
+    ws.close();
+    return;
+  }
+
+  const browserId = uuidv4().slice(0, 8);
+  console.log("Browser Realtime talk:", browserId);
+  let bridge = null;
+
+  createRealtimeBridge({
+    openai,
+    model: config.realtimeModel,
+    voice: config.realtimeVoice,
+    instructions: SYSTEM_PROMPT,
+    onReady: () => {
+      ws.send(JSON.stringify({ type: "ready" }));
+      bridge?.requestGreeting();
+    },
+    onAudio24: (pcm24) => {
+      if (ws.readyState === 1) ws.send(pcm24);
+    },
+    onUserTranscript: (text) => {
+      logTranscript(browserId, "user", text);
+      ws.send(JSON.stringify({ type: "transcript", role: "user", text }));
+    },
+    onAssistantTranscript: (text) => {
+      logTranscript(browserId, "assistant", text);
+      ws.send(JSON.stringify({ type: "transcript", role: "assistant", text }));
+    },
+    onSpeechStarted: () => {
+      ws.send(JSON.stringify({ type: "speech_started" }));
+    },
+    onError: (err) => {
+      ws.send(JSON.stringify({ type: "error", message: err.message }));
+    },
+  })
+    .then((b) => {
+      bridge = b;
+    })
+    .catch((err) => {
+      ws.send(JSON.stringify({ type: "error", message: err.message }));
+      ws.close();
+    });
+
+  ws.on("message", (data) => {
+    if (!bridge) return;
+    const pcm = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (pcm.length) bridge.appendAudio16k(pcm);
+  });
+
+  ws.on("close", () => {
+    bridge?.disconnect();
+    bridge = null;
   });
 });
 
