@@ -154,10 +154,11 @@ async function speakOnPhone(callConnectionId, text, operationContext) {
 
   const fileId = uuidv4();
   const filePath = path.join(AUDIO_DIR, `${fileId}.mp3`);
+  const audioUrl = `${config.callbackUri}/audio/${fileId}.mp3`;
   fs.writeFileSync(filePath, Buffer.from(await speech.arrayBuffer()));
 
   await getCallMedia(callConnectionId).playToAll(
-    [{ kind: "file", file: { uri: `${config.callbackUri}/audio/${fileId}.mp3` } }],
+    [{ kind: "fileSource", url: audioUrl }],
     { operationContext }
   );
 }
