@@ -248,6 +248,9 @@
             speakBrowser(msg.text);
           } else if (msg.type === "interrupt") {
             stopBrowserTts();
+            liveReply.textContent = "";
+          } else if (msg.type === "thinking") {
+            liveReply.textContent = "Thinking…";
           }
         } catch {
           /* ignore */

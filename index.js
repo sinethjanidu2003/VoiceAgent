@@ -216,6 +216,13 @@ function startBrowserAiSession(callConnectionId) {
   const session = getSession(callConnectionId);
   if (session.browserAi) return session.browserAi;
 
+  // Stop phone-side AI so it doesn't compete with browser AI on the same audio
+  stopStreamingSession(callConnectionId);
+  stopPhonePlayback(callConnectionId);
+  session.mode = "listening";
+  session.isProcessing = false;
+  session.greeted = true;
+
   session.browserAi = createStreamingSession({
     openai,
     chatModel: config.chatModel,
@@ -229,9 +236,10 @@ function startBrowserAiSession(callConnectionId) {
       logTranscript(
         callConnectionId,
         "system",
-        "Browser AI active — caller speech → Whisper → ChatGPT → your speakers"
+        "Browser AI active — speak on phone, pause ~1.5s, AI replies in your browser"
       );
     },
+    onThinking: () => sendToMonitors(callConnectionId, { type: "thinking" }),
     onUserTranscript: (text) => logTranscript(callConnectionId, "user", text),
     onAssistantToken: (text) => sendToMonitors(callConnectionId, { type: "token", text }),
     onAssistantText: (text) => logTranscript(callConnectionId, "assistant", text),
@@ -239,7 +247,7 @@ function startBrowserAiSession(callConnectionId) {
     onInterrupt: () => sendToMonitors(callConnectionId, { type: "interrupt" }),
     onError: (err) => {
       console.error(`[${callConnectionId}] Browser AI:`, err.message);
-      logTranscript(callConnectionId, "system", `Browser AI error: ${err.message}`);
+      logTranscript(callConnectionId, "system", `Browser AI: ${err.message}`);
     },
   });
 
