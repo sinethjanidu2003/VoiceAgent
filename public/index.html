@@ -236,7 +236,10 @@
         reloadTranscript();
       };
       monitorWs.onmessage = (e) => {
-        
+        if (e.data instanceof ArrayBuffer) {
+          playPcmChunk(e.data);
+          return;
+        }
         try {
           const msg = JSON.parse(e.data);
           if (msg.type === "transcript") {
@@ -256,10 +259,7 @@
           /* ignore */
         }
 
-        if (e.data instanceof ArrayBuffer) {
-          playPcmChunk(e.data);
-          return;
-        }
+       
       };
       monitorWs.onclose = () => {
         joinBtn.disabled = !callConnectionId;
