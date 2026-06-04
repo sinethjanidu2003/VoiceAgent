@@ -32,12 +32,16 @@
     <label>Call this number:</label>
     <input id="phone" type="tel" placeholder="+15551234567" />
     <br />
-    <label><input type="radio" name="callMode" value="stream" checked /> Streaming AI on phone (OpenAI TTS for caller)</label>
-    <label><input type="radio" name="callMode" value="ai" /> Batch AI on phone</label>
+    <label><input type="radio" name="callMode" value="ai" checked /> Batch AI on phone (recommended)</label>
+    <label><input type="radio" name="callMode" value="stream" /> Streaming AI on phone</label>
     <label><input type="radio" name="callMode" value="live" /> Live — you talk from browser (no AI)</label>
     <br />
     <button id="callBtn">Start call</button>
     <button id="joinBtn" disabled>Join call (listen)</button>
+    <label>
+      <input id="browserAi" type="checkbox" checked />
+      AI in browser: hear caller → text → ChatGPT → built-in voice
+    </label>
     <button id="takeoverBtn" disabled>Take over (speak live)</button>
     <button id="streamBtn" disabled>Streaming AI</button>
     <button id="aiBtn" disabled>Batch AI</button>
@@ -50,10 +54,18 @@
     <p class="system" style="font-size:0.85rem;margin:0 0 0.5rem">
       When you join a call, the caller's speech is transcribed here (Whisper).
     </p>
+    <div id="liveReply" class="assistant" style="font-style:italic;min-height:1rem"></div>
     <div id="log"></div>
   </div>
 
-  <script>
+  <script type="module">
+    import {
+      initBrowserTts,
+      speakBrowser,
+      stopBrowserTts,
+      isBrowserTtsSupported,
+    } from "./browser-tts.js";
+
     const phone = document.getElementById("phone");
     const callBtn = document.getElementById("callBtn");
     const joinBtn = document.getElementById("joinBtn");
@@ -63,6 +75,8 @@
     const status = document.getElementById("status");
     const audioStatus = document.getElementById("audioStatus");
     const log = document.getElementById("log");
+    const liveReply = document.getElementById("liveReply");
+    const browserAiCheck = document.getElementById("browserAi");
 
     let callConnectionId = null;
     let monitorWs = null;
@@ -76,7 +90,7 @@
     const SAMPLE_RATE = 16000;
 
     function selectedCallMode() {
-      return document.querySelector('input[name="callMode"]:checked')?.value || "stream";
+      return document.querySelector('input[name="callMode"]:checked')?.value || "ai";
     }
 
     function wsBase() {
@@ -162,10 +176,12 @@
     }
 
     function disconnectMonitor() {
+      stopBrowserTts();
       stopMic();
       monitorWs?.close();
       monitorWs = null;
       nextPlayTime = 0;
+      liveReply.textContent = "";
     }
 
     function appendTranscriptLine(entry) {
@@ -179,11 +195,13 @@
     }
 
     async function reloadTranscript() {
-      const res = await fetch("/api/transcript");
-      const lines = await res.json();
-      const forCall = callConnectionId
-        ? lines.filter((e) => e.callConnectionId === callConnectionId)
-        : lines;
+      if (!callConnectionId) {
+        log.innerHTML = "";
+        lastCount = 0;
+        return;
+      }
+      const res = await fetch(`/api/transcript?callConnectionId=${encodeURIComponent(callConnectionId)}`);
+      const forCall = await res.json();
       lastCount = forCall.length;
       log.innerHTML = forCall
         .map(
@@ -198,10 +216,19 @@
     function joinMonitor() {
       if (!callConnectionId) return;
       disconnectMonitor();
-      monitorWs = new WebSocket(`${wsBase()}/monitor?callConnectionId=${callConnectionId}`);
+      const ai = browserAiCheck.checked ? "1" : "0";
+      monitorWs = new WebSocket(
+        `${wsBase()}/monitor?callConnectionId=${encodeURIComponent(callConnectionId)}&browserAi=${ai}`
+      );
       monitorWs.binaryType = "arraybuffer";
-      monitorWs.onopen = () => {
-        audioStatus.textContent = "Connected — you can hear the phone call.";
+      monitorWs.onopen = async () => {
+        if (browserAiCheck.checked && isBrowserTtsSupported()) {
+          await initBrowserTts("en");
+        }
+        audioStatus.textContent = browserAiCheck.checked
+          ? "Listening — caller → Whisper → ChatGPT → browser voice."
+          : "Connected — you can hear the phone call.";
+        audioStatus.className = "live";
         joinBtn.disabled = true;
         takeoverBtn.disabled = false;
         streamBtn.disabled = false;
@@ -209,16 +236,26 @@
         reloadTranscript();
       };
       monitorWs.onmessage = (e) => {
-        if (e.data instanceof ArrayBuffer) {
-          console.log("Received PCM data", e.data);
-          playPcmChunk(e.data);
-          return;
-        }
+        
         try {
           const msg = JSON.parse(e.data);
-          if (msg.type === "transcript") appendTranscriptLine(msg);
+          if (msg.type === "transcript") {
+            appendTranscriptLine(msg);
+          } else if (msg.type === "token") {
+            liveReply.textContent += msg.text;
+          } else if (msg.type === "speak") {
+            liveReply.textContent = "";
+            speakBrowser(msg.text);
+          } else if (msg.type === "interrupt") {
+            stopBrowserTts();
+          }
         } catch {
           /* ignore */
+        }
+
+        if (e.data instanceof ArrayBuffer) {
+          playPcmChunk(e.data);
+          return;
         }
       };
       monitorWs.onclose = () => {
@@ -253,6 +290,8 @@
       callConnectionId = data.callConnectionId;
       status.textContent = `Call started (${callConnectionId}) — mode: ${data.callMode}`;
       joinBtn.disabled = false;
+      lastCount = 0;
+      reloadTranscript();
 
       if (callMode === "live") {
         joinMonitor();
@@ -267,11 +306,11 @@
     aiBtn.onclick = () => setCallMode("ai");
 
     setInterval(async () => {
-      const res = await fetch("/api/transcript");
-      const lines = await res.json();
-      const forCall = callConnectionId
-        ? lines.filter((e) => e.callConnectionId === callConnectionId)
-        : lines;
+      if (!callConnectionId) return;
+      const res = await fetch(
+        `/api/transcript?callConnectionId=${encodeURIComponent(callConnectionId)}`
+      );
+      const forCall = await res.json();
       if (forCall.length === lastCount) return;
       lastCount = forCall.length;
       log.innerHTML = forCall

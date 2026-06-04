@@ -70,6 +70,15 @@ function notifyMonitorTranscript(callConnectionId, role, text) {
   }
 }
 
+function sendToMonitors(callConnectionId, payload) {
+  const monitors = browserMonitors.get(callConnectionId);
+  if (!monitors?.size) return;
+  const msg = typeof payload === "string" ? payload : JSON.stringify(payload);
+  for (const client of monitors) {
+    if (client.readyState === 1) client.send(msg);
+  }
+}
+
 function broadcastPhoneAudio(callConnectionId, pcmBuffer) {
   const monitors = browserMonitors.get(callConnectionId);
   if (!monitors?.size) return;
@@ -175,20 +184,21 @@ function startStreamingSession(callConnectionId) {
         session.streaming.requestGreeting();
       }
     },
-    onUserTranscript: (text) => {
-      if (!hasMonitorListeners(callConnectionId)) {
-        logTranscript(callConnectionId, "user", text);
-      }
-    },
+    onUserTranscript: (text) => logTranscript(callConnectionId, "user", text),
     onAssistantText: (text) => logTranscript(callConnectionId, "assistant", text),
     onSpeak: (text) => {
       session.mode = "playing";
-      speakOnPhone(callConnectionId, text, "Stream").catch((err) =>
-        console.error("Stream TTS:", err.message)
-      );
+      speakOnPhone(callConnectionId, text, "Stream").catch((err) => {
+        console.error("Stream TTS:", err.message);
+        logTranscript(callConnectionId, "system", `AI speech failed: ${err.message}`);
+        session.mode = "listening";
+      });
     },
     onInterrupt: () => stopPhonePlayback(callConnectionId),
-    onError: (err) => console.error(`[${callConnectionId}] Stream:`, err.message),
+    onError: (err) => {
+      console.error(`[${callConnectionId}] Stream:`, err.message);
+      logTranscript(callConnectionId, "system", `AI error: ${err.message}`);
+    },
   });
 
   return session.streaming;
@@ -200,6 +210,47 @@ function stopStreamingSession(callConnectionId) {
   session.streaming.disconnect();
   session.streaming = null;
   session.streamingGreeted = false;
+}
+
+function startBrowserAiSession(callConnectionId) {
+  const session = getSession(callConnectionId);
+  if (session.browserAi) return session.browserAi;
+
+  session.browserAi = createStreamingSession({
+    openai,
+    chatModel: config.chatModel,
+    systemPrompt: SYSTEM_PROMPT,
+    sampleRate: SAMPLE_RATE,
+    silenceMs: SILENCE_MS,
+    minPcmBytes: MIN_PCM_BYTES,
+    speakMode: "browser",
+    onReady: () => {
+      console.log(`[${callConnectionId}] Browser AI listening on call audio`);
+      logTranscript(
+        callConnectionId,
+        "system",
+        "Browser AI active — caller speech → Whisper → ChatGPT → your speakers"
+      );
+    },
+    onUserTranscript: (text) => logTranscript(callConnectionId, "user", text),
+    onAssistantToken: (text) => sendToMonitors(callConnectionId, { type: "token", text }),
+    onAssistantText: (text) => logTranscript(callConnectionId, "assistant", text),
+    onSpeakSentence: (text) => sendToMonitors(callConnectionId, { type: "speak", text }),
+    onInterrupt: () => sendToMonitors(callConnectionId, { type: "interrupt" }),
+    onError: (err) => {
+      console.error(`[${callConnectionId}] Browser AI:`, err.message);
+      logTranscript(callConnectionId, "system", `Browser AI error: ${err.message}`);
+    },
+  });
+
+  return session.browserAi;
+}
+
+function stopBrowserAiSession(callConnectionId) {
+  const session = callSessions.get(callConnectionId);
+  if (!session?.browserAi) return;
+  session.browserAi.disconnect();
+  session.browserAi = null;
 }
 
 function mediaWsUrl() {
@@ -235,6 +286,7 @@ function getSession(callConnectionId) {
       greeted: false,
       streamingGreeted: false,
       streaming: null,
+      browserAi: null,
       monitorAudioChunks: [],
       monitorHadSpeech: false,
       monitorLastSpeechAt: 0,
@@ -251,6 +303,7 @@ function getCallMedia(id) {
 
 async function hangUp(callConnectionId) {
   stopStreamingSession(callConnectionId);
+  stopBrowserAiSession(callConnectionId);
   callSessions.delete(callConnectionId);
   acsMediaSockets.delete(callConnectionId);
   browserMonitors.delete(callConnectionId);
@@ -260,25 +313,41 @@ async function hangUp(callConnectionId) {
 /** OpenAI TTS → save mp3 → play on phone via ACS file URL */
 async function speakOnPhone(callConnectionId, text, operationContext) {
   const session = getSession(callConnectionId);
+  if (!openai) {
+    logTranscript(callConnectionId, "system", "OpenAI not configured — set OPENAI_API_KEY on server");
+    return;
+  }
+  if (!acsClient) {
+    logTranscript(callConnectionId, "system", "ACS not configured");
+    return;
+  }
+
   session.mode = "playing";
 
-  const speech = await openai.audio.speech.create({
-    model: "tts-1",
-    voice: config.ttsVoice,
-    input: text,
-  });
+  try {
+    const speech = await openai.audio.speech.create({
+      model: "tts-1",
+      voice: config.ttsVoice,
+      input: text,
+    });
 
-  const fileId = uuidv4();
-  const filePath = path.join(AUDIO_DIR, `${fileId}.mp3`);
-  const audioUrl = `${config.callbackUri}/audio/${fileId}.mp3`;
-  fs.writeFileSync(filePath, Buffer.from(await speech.arrayBuffer()));
+    const fileId = uuidv4();
+    const filePath = path.join(AUDIO_DIR, `${fileId}.mp3`);
+    const audioUrl = `${config.callbackUri}/audio/${fileId}.mp3`;
+    fs.writeFileSync(filePath, Buffer.from(await speech.arrayBuffer()));
 
-  await getCallMedia(callConnectionId).playToAll(
-    [{ kind: "fileSource", url: audioUrl }],
-    { operationContext }
-  );
+    console.log(`[${callConnectionId}] Playing TTS: ${audioUrl}`);
+    await getCallMedia(callConnectionId).playToAll(
+      [{ kind: "fileSource", url: audioUrl }],
+      { operationContext }
+    );
 
-  scheduleListeningFallback(callConnectionId, text, operationContext);
+    scheduleListeningFallback(callConnectionId, text, operationContext);
+  } catch (err) {
+    console.error(`[${callConnectionId}] speakOnPhone:`, err.message);
+    logTranscript(callConnectionId, "system", `TTS/play failed: ${err.message}`);
+    session.mode = "listening";
+  }
 }
 
 async function transcribePcm(pcmBuffer) {
@@ -368,18 +437,14 @@ async function processUserAudio(callConnectionId) {
     }
 
     session.silenceRetries = 2;
-    if (!hasMonitorListeners(callConnectionId)) {
-      logTranscript(callConnectionId, "user", text);
-    }
+    logTranscript(callConnectionId, "user", text);
 
     if (wantsGoodbye(text)) {
-      logTranscript(callConnectionId, "assistant", GOODBYE);
       await speakOnPhone(callConnectionId, GOODBYE, "Goodbye");
       return;
     }
 
     const reply = await askChatGpt(session, text);
-    logTranscript(callConnectionId, "assistant", reply);
     await speakOnPhone(callConnectionId, reply, "Conversation");
   } catch (err) {
     console.error("Process audio error:", err.message);
@@ -429,6 +494,12 @@ function onAudioPacket(callConnectionId, base64) {
   if (!buf.length) return;
 
   broadcastPhoneAudio(callConnectionId, buf);
+
+  // Browser join AI: phone audio → Whisper → ChatGPT → browser TTS
+  if (session.browserAi) {
+    session.browserAi.appendAudio16k(buf);
+    return;
+  }
 
   if (hasMonitorListeners(callConnectionId)) {
     session.monitorAudioChunks.push(buf);
@@ -510,7 +581,13 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-app.get("/api/transcript", (_req, res) => res.json(transcriptLog));
+app.get("/api/transcript", (req, res) => {
+  const { callConnectionId } = req.query;
+  if (callConnectionId) {
+    return res.json(transcriptLog.filter((e) => e.callConnectionId === callConnectionId));
+  }
+  res.json(transcriptLog);
+});
 
 app.post("/api/call/:id/mode", async (req, res) => {
   const callConnectionId = req.params.id;
@@ -548,6 +625,9 @@ app.post("/api/call/:id/mode", async (req, res) => {
 app.post("/call", async (req, res) => {
   if (!acsClient) {
     return res.status(503).json({ success: false, error: "Fill in .env and restart" });
+  }
+  if (!openai) {
+    return res.status(503).json({ success: false, error: "OPENAI_API_KEY missing on server" });
   }
 
   try {
@@ -627,9 +707,19 @@ app.post("/api/callbacks/:contextId", async (req, res) => {
       type === "Microsoft.Communication.playFailed"
     ) {
       console.error("Play failed:", eventData.resultInformation);
+      logTranscript(
+        callConnectionId,
+        "system",
+        `Play failed: ${eventData.resultInformation?.message || "check CALLBACK_URI and /audio URL"}`
+      );
       const session = getSession(callConnectionId);
       session.mode = "listening";
       session.audioChunks = [];
+    } else if (
+      type === "Microsoft.Communication.CallConnected" ||
+      type === "Microsoft.Communication.callConnected"
+    ) {
+      logTranscript(callConnectionId, "system", "Call answered");
     } else if (type === "Microsoft.Communication.CallDisconnected") {
       stopStreamingSession(callConnectionId);
       callSessions.delete(callConnectionId);
@@ -664,7 +754,13 @@ server.on("upgrade", (req, socket, head) => {
     mediaWss.handleUpgrade(req, socket, head, (ws) => mediaWss.emit("connection", ws, req));
   } else if (pathname === "/monitor") {
     monitorWss.handleUpgrade(req, socket, head, (ws) =>
-      monitorWss.emit("connection", ws, req, searchParams.get("callConnectionId"))
+      monitorWss.emit(
+        "connection",
+        ws,
+        req,
+        searchParams.get("callConnectionId"),
+        searchParams.get("browserAi") === "1"
+      )
     );
   } else if (pathname === "/realtime-talk") {
     realtimeWss.handleUpgrade(req, socket, head, (ws) => realtimeWss.emit("connection", ws));
@@ -693,13 +789,18 @@ mediaWss.on("connection", (ws, req) => {
   });
 });
 
-monitorWss.on("connection", (ws, _req, callConnectionId) => {
+monitorWss.on("connection", (ws, _req, callConnectionId, browserAi) => {
   if (!callConnectionId || !callSessions.has(callConnectionId)) {
     ws.close();
     return;
   }
-  console.log("Browser monitor joined:", callConnectionId);
+  console.log("Browser monitor joined:", callConnectionId, browserAi ? "+ browser AI" : "");
   getMonitorSet(callConnectionId).add(ws);
+
+  if (browserAi && openai) {
+    startBrowserAiSession(callConnectionId);
+  }
+
   ws.on("message", (data) => {
     const session = callSessions.get(callConnectionId);
     if (!session || session.callMode !== "live") return;
@@ -708,6 +809,9 @@ monitorWss.on("connection", (ws, _req, callConnectionId) => {
   });
   ws.on("close", () => {
     getMonitorSet(callConnectionId).delete(ws);
+    if (!hasMonitorListeners(callConnectionId)) {
+      stopBrowserAiSession(callConnectionId);
+    }
   });
 });
 
@@ -769,3 +873,13 @@ server.listen(PORT, () => {
   console.log(`Phone voice agent → http://localhost:${PORT}`);
   initClients();
 });
+
+// Flush speech buffers even when ACS stops sending packets during silence
+setInterval(() => {
+  for (const callConnectionId of callSessions.keys()) {
+    maybeFlushSpeech(callConnectionId);
+    maybeFlushMonitorTranscript(callConnectionId);
+    callSessions.get(callConnectionId)?.streaming?.tickFlush?.();
+    callSessions.get(callConnectionId)?.browserAi?.tickFlush?.();
+  }
+}, 300);
