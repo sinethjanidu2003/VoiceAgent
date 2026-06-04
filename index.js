@@ -162,7 +162,7 @@ function initClients() {
   }
 }
 
-function startStreamingSession(callConnectionId) {
+function startStreamingSession(callConnectionId, { skipGreeting = false } = {}) {
   const session = getSession(callConnectionId);
   if (session.streaming) return session.streaming;
 
@@ -178,7 +178,7 @@ function startStreamingSession(callConnectionId) {
     onReady: () => {
       console.log(`[${callConnectionId}] Streaming session ready`);
       session.mode = "listening";
-      if (!session.streamingGreeted) {
+      if (!skipGreeting && !session.streamingGreeted) {
         session.streamingGreeted = true;
         logTranscript(callConnectionId, "system", "Streaming AI connected");
         session.streaming.requestGreeting();
@@ -216,6 +216,11 @@ function startBrowserAiSession(callConnectionId) {
   const session = getSession(callConnectionId);
   if (session.browserAi) return session.browserAi;
 
+  if (session.callMode !== "browser") {
+    session.savedCallMode = session.callMode;
+    session.callMode = "browser";
+  }
+
   session.browserAi = createStreamingSession({
     openai,
     chatModel: config.chatModel,
@@ -246,11 +251,15 @@ function startBrowserAiSession(callConnectionId) {
   return session.browserAi;
 }
 
-function stopBrowserAiSession(callConnectionId) {
+function stopBrowserAiSession(callConnectionId, restoreMode = true) {
   const session = callSessions.get(callConnectionId);
   if (!session?.browserAi) return;
   session.browserAi.disconnect();
   session.browserAi = null;
+  if (restoreMode && session.savedCallMode) {
+    session.callMode = session.savedCallMode;
+    session.savedCallMode = undefined;
+  }
 }
 
 function mediaWsUrl() {
@@ -291,6 +300,7 @@ function getSession(callConnectionId) {
       monitorHadSpeech: false,
       monitorLastSpeechAt: 0,
       monitorIsTranscribing: false,
+      savedCallMode: undefined,
       messages: [{ role: "system", content: SYSTEM_PROMPT }],
     });
   }
@@ -495,13 +505,13 @@ function onAudioPacket(callConnectionId, base64) {
 
   broadcastPhoneAudio(callConnectionId, buf);
 
-  // Browser join AI: phone audio → Whisper → ChatGPT → browser TTS
-  if (session.browserAi) {
+  // Browser-only AI while monitoring (callMode === "browser")
+  if (session.callMode === "browser" && session.browserAi) {
     session.browserAi.appendAudio16k(buf);
     return;
   }
 
-  if (hasMonitorListeners(callConnectionId)) {
+  if (hasMonitorListeners(callConnectionId) && !session.browserAi) {
     session.monitorAudioChunks.push(buf);
     session.monitorLastSpeechAt = Date.now();
     session.monitorHadSpeech = true;
@@ -564,6 +574,9 @@ async function onPlayCompleted(callConnectionId, context) {
   session.mode = "listening";
   session.audioChunks = [];
   session.hadSpeech = false;
+  if (session.streaming && session.callMode === "stream") {
+    session.streaming.tickFlush?.();
+  }
   console.log(`[${callConnectionId}] Now listening for speech…`);
 }
 
@@ -599,23 +612,25 @@ app.post("/api/call/:id/mode", async (req, res) => {
   const mode =
     req.body?.mode === "live" ? "live" : req.body?.mode === "stream" ? "stream" : "ai";
 
+  stopBrowserAiSession(callConnectionId, false);
+  session.savedCallMode = undefined;
   stopStreamingSession(callConnectionId);
   session.callMode = mode;
   session.audioChunks = [];
   session.hadSpeech = false;
   session.isProcessing = false;
+  session.mode = "listening";
 
   if (mode === "live") {
     stopPhonePlayback(callConnectionId);
-    session.mode = "listening";
     logTranscript(callConnectionId, "system", "You took over — browser mic is live on the call");
   } else if (mode === "stream") {
     stopPhonePlayback(callConnectionId);
-    session.mode = "listening";
-    startStreamingSession(callConnectionId);
+    const skipGreeting = session.greeted || session.streamingGreeted;
+    startStreamingSession(callConnectionId, { skipGreeting });
+    if (!skipGreeting) session.greeted = true;
     logTranscript(callConnectionId, "system", "Streaming AI active (Whisper + ChatGPT)");
   } else {
-    session.mode = "listening";
     logTranscript(callConnectionId, "system", "Batch AI assistant resumed");
   }
 

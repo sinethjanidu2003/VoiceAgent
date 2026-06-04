@@ -52,7 +52,7 @@
   <div class="card">
     <strong>Live transcript</strong>
     <p class="system" style="font-size:0.85rem;margin:0 0 0.5rem">
-      When you join a call, the caller's speech is transcribed here (Whisper).
+      Pick one AI mode: browser AI (while listening) <em>or</em> phone AI (Batch/Streaming) — not both.
     </p>
     <div id="liveReply" class="assistant" style="font-style:italic;min-height:1rem"></div>
     <div id="log"></div>
@@ -100,11 +100,16 @@
 
     async function setCallMode(mode) {
       if (!callConnectionId) return;
-      await fetch(`/api/call/${callConnectionId}/mode`, {
+      const res = await fetch(`/api/call/${callConnectionId}/mode`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mode }),
       });
+      const data = await res.json();
+      if (!data.success) {
+        audioStatus.textContent = `Mode switch failed`;
+        return;
+      }
       if (mode === "live") {
         await startMic();
         audioStatus.textContent = "Live — your mic is on the phone call. Use headphones.";
@@ -301,9 +306,18 @@
     };
 
     joinBtn.onclick = () => joinMonitor();
-    takeoverBtn.onclick = () => setCallMode("live");
-    streamBtn.onclick = () => setCallMode("stream");
-    aiBtn.onclick = () => setCallMode("ai");
+    takeoverBtn.onclick = () => {
+      browserAiCheck.checked = false;
+      setCallMode("live");
+    };
+    streamBtn.onclick = () => {
+      browserAiCheck.checked = false;
+      setCallMode("stream");
+    };
+    aiBtn.onclick = () => {
+      browserAiCheck.checked = false;
+      setCallMode("ai");
+    };
 
     setInterval(async () => {
       if (!callConnectionId) return;
