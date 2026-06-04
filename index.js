@@ -7,7 +7,7 @@ import express from "express";
 import { WebSocketServer } from "ws";
 import { v4 as uuidv4 } from "uuid";
 import OpenAI, { toFile } from "openai";
-import { CallAutomationClient, StreamingData } from "@azure/communication-call-automation";
+import { CallAutomationClient, StreamingData, createOutboundAudioData, createOutboundStopAudioData } from "@azure/communication-call-automation";
 import { pcm16ToWav } from "./lib/wav.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,8 +35,41 @@ let acsClient = null;
 /** @type {OpenAI | null} */
 let openai = null;
 
+/** @type {Map<string, import("ws").WebSocket>} */
+const acsMediaSockets = new Map();
+
+/** @type {Map<string, Set<import("ws").WebSocket>>} */
+const browserMonitors = new Map();
+
 /** @type {Map<string, object>} */
 const callSessions = new Map();
+
+function getMonitorSet(callConnectionId) {
+  if (!browserMonitors.has(callConnectionId)) {
+    browserMonitors.set(callConnectionId, new Set());
+  }
+  return browserMonitors.get(callConnectionId);
+}
+
+function broadcastPhoneAudio(callConnectionId, pcmBuffer) {
+  const monitors = browserMonitors.get(callConnectionId);
+  if (!monitors?.size) return;
+  for (const client of monitors) {
+    if (client.readyState === 1) client.send(pcmBuffer);
+  }
+}
+
+function sendAudioToPhone(callConnectionId, pcmBuffer) {
+  const acsWs = acsMediaSockets.get(callConnectionId);
+  if (!acsWs || acsWs.readyState !== 1) return;
+  acsWs.send(createOutboundAudioData(pcmBuffer.toString("base64")));
+}
+
+function stopPhonePlayback(callConnectionId) {
+  const acsWs = acsMediaSockets.get(callConnectionId);
+  if (!acsWs || acsWs.readyState !== 1) return;
+  acsWs.send(createOutboundStopAudioData());
+}
 
 const transcriptLog = [];
 const MAX_LOG = 200;
@@ -110,7 +143,7 @@ function mediaStreamingOptions() {
     contentType: "audio",
     audioChannelType: "mixed",
     startMediaStreaming: true,
-    enableBidirectional: false,
+    enableBidirectional: true,
     enableDtmfTones: false,
     audioFormat: "Pcm16KMono",
   };
@@ -120,6 +153,7 @@ function getSession(callConnectionId) {
   if (!callSessions.has(callConnectionId)) {
     callSessions.set(callConnectionId, {
       mode: "idle",
+      callMode: "ai",
       audioChunks: [],
       hadSpeech: false,
       lastSpeechAt: 0,
@@ -138,6 +172,8 @@ function getCallMedia(id) {
 
 async function hangUp(callConnectionId) {
   callSessions.delete(callConnectionId);
+  acsMediaSockets.delete(callConnectionId);
+  browserMonitors.delete(callConnectionId);
   await acsClient.getCallConnection(callConnectionId).hangUp(true);
 }
 
@@ -271,14 +307,16 @@ async function processUserAudio(callConnectionId) {
   }
 }
 
-function onAudioPacket(callConnectionId, base64, isSilent) {
+function onAudioPacket(callConnectionId, base64) {
   const session = getSession(callConnectionId);
-  if (session.mode !== "listening" || session.isProcessing) return;
-
   const buf = Buffer.from(base64, "base64");
   if (!buf.length) return;
 
-  // PSTN streams often mark speech as isSilent — record all audio while listening
+  broadcastPhoneAudio(callConnectionId, buf);
+
+  if (session.callMode === "live") return;
+  if (session.mode !== "listening" || session.isProcessing) return;
+
   session.audioChunks.push(buf);
   session.lastSpeechAt = Date.now();
   session.hadSpeech = true;
@@ -293,6 +331,11 @@ function onMediaMessage(callConnectionId, packetData) {
 
   if (kind === "AudioMetadata") {
     console.log("Audio stream ready:", callConnectionId);
+    if (session.callMode === "live") {
+      logTranscript(callConnectionId, "system", "Live mode — speak from your browser");
+      session.mode = "listening";
+      return;
+    }
     if (!session.greeted) {
       session.greeted = true;
       logTranscript(callConnectionId, "system", "Call connected — agent speaking");
@@ -302,7 +345,7 @@ function onMediaMessage(callConnectionId, packetData) {
   }
 
   if (kind === "AudioData" && parsed.data) {
-    onAudioPacket(callConnectionId, parsed.data, parsed.isSilent);
+    onAudioPacket(callConnectionId, parsed.data);
   }
 }
 
@@ -337,13 +380,38 @@ app.get("/api/health", (_req, res) => {
 
 app.get("/api/transcript", (_req, res) => res.json(transcriptLog));
 
+app.post("/api/call/:id/mode", (req, res) => {
+  const callConnectionId = req.params.id;
+  const session = callSessions.get(callConnectionId);
+  if (!session) {
+    return res.status(404).json({ success: false, error: "Call not found" });
+  }
+
+  const mode = req.body?.mode === "live" ? "live" : "ai";
+  session.callMode = mode;
+  session.audioChunks = [];
+  session.hadSpeech = false;
+  session.isProcessing = false;
+
+  if (mode === "live") {
+    stopPhonePlayback(callConnectionId);
+    session.mode = "listening";
+    logTranscript(callConnectionId, "system", "You took over — browser mic is live on the call");
+  } else {
+    session.mode = "listening";
+    logTranscript(callConnectionId, "system", "AI assistant resumed");
+  }
+
+  res.json({ success: true, mode });
+});
+
 app.post("/call", async (req, res) => {
   if (!acsClient) {
     return res.status(503).json({ success: false, error: "Fill in .env and restart" });
   }
 
   try {
-    const { toPhone } = req.body;
+    const { toPhone, liveMode } = req.body;
     if (!toPhone) return res.status(400).json({ success: false, error: "toPhone required" });
 
     if (!config.fromPhone) {
@@ -370,9 +438,17 @@ app.post("/call", async (req, res) => {
     );
 
     const callConnectionId = result.callConnection.callConnectionId;
-    logTranscript(callConnectionId, "system", `Calling ${normalized}…`);
+    const session = getSession(callConnectionId);
+    session.callMode = liveMode ? "live" : "ai";
+    if (liveMode) session.greeted = true;
 
-    res.json({ success: true, callConnectionId, toPhone: normalized });
+    logTranscript(
+      callConnectionId,
+      "system",
+      liveMode ? `Calling ${normalized} (live browser mode)…` : `Calling ${normalized}…`
+    );
+
+    res.json({ success: true, callConnectionId, toPhone: normalized, callMode: session.callMode });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -411,6 +487,8 @@ app.post("/api/callbacks/:contextId", async (req, res) => {
       session.audioChunks = [];
     } else if (type === "Microsoft.Communication.CallDisconnected") {
       callSessions.delete(callConnectionId);
+      acsMediaSockets.delete(callConnectionId);
+      browserMonitors.delete(callConnectionId);
       logTranscript(callConnectionId, "system", "Call ended");
     }
   } catch (err) {
@@ -431,11 +509,16 @@ app.delete("/hangup/:id", async (req, res) => {
 
 const server = http.createServer(app);
 const mediaWss = new WebSocketServer({ noServer: true });
+const monitorWss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  const { pathname } = new URL(req.url, `http://${req.headers.host}`);
+  const { pathname, searchParams } = new URL(req.url, `http://${req.headers.host}`);
   if (pathname === "/media") {
     mediaWss.handleUpgrade(req, socket, head, (ws) => mediaWss.emit("connection", ws, req));
+  } else if (pathname === "/monitor") {
+    monitorWss.handleUpgrade(req, socket, head, (ws) =>
+      monitorWss.emit("connection", ws, req, searchParams.get("callConnectionId"))
+    );
   } else {
     socket.destroy();
   }
@@ -448,12 +531,34 @@ mediaWss.on("connection", (ws, req) => {
     return;
   }
   console.log("ACS audio stream:", callConnectionId);
+  acsMediaSockets.set(callConnectionId, ws);
   ws.on("message", (data) => {
     try {
       onMediaMessage(callConnectionId, data);
     } catch (err) {
       console.error("Media error:", err.message);
     }
+  });
+  ws.on("close", () => {
+    if (acsMediaSockets.get(callConnectionId) === ws) acsMediaSockets.delete(callConnectionId);
+  });
+});
+
+monitorWss.on("connection", (ws, _req, callConnectionId) => {
+  if (!callConnectionId || !callSessions.has(callConnectionId)) {
+    ws.close();
+    return;
+  }
+  console.log("Browser monitor joined:", callConnectionId);
+  getMonitorSet(callConnectionId).add(ws);
+  ws.on("message", (data) => {
+    const session = callSessions.get(callConnectionId);
+    if (!session || session.callMode !== "live") return;
+    const pcm = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (pcm.length) sendAudioToPhone(callConnectionId, pcm);
+  });
+  ws.on("close", () => {
+    getMonitorSet(callConnectionId).delete(ws);
   });
 });
 

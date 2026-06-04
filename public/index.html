@@ -9,48 +9,232 @@
     h1 { font-size: 1.3rem; }
     .card { background: #1e1e1e; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
     input { padding: 0.5rem; font-size: 1rem; width: 200px; }
-    button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
+    button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; margin-right: 0.5rem; margin-top: 0.5rem; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
     #log { font-size: 0.9rem; max-height: 400px; overflow-y: auto; }
     .user { color: #7dd3fc; }
     .assistant { color: #86efac; }
     .system { color: #94a3b8; font-style: italic; }
     .flow { color: #a78bfa; font-size: 0.85rem; margin-bottom: 1rem; }
+    .live { color: #fbbf24; font-weight: 600; }
+    label { display: block; margin: 0.5rem 0; }
   </style>
 </head>
 <body>
   <h1>Phone Voice Agent</h1>
-  <p class="flow">Phone → Whisper → ChatGPT → OpenAI TTS → Phone (public OpenAI API)</p>
+  <p class="flow">Phone ↔ browser live audio, or AI: Whisper → ChatGPT → TTS</p>
 
   <div class="card">
-    <label>Call this number:</label><br /><br />
+    <label>Call this number:</label>
     <input id="phone" type="tel" placeholder="+15551234567" />
+    <br />
+    <label>
+      <input id="liveMode" type="checkbox" />
+      Start in live mode (you talk from browser, no AI greeting)
+    </label>
+    <br />
     <button id="callBtn">Start call</button>
+    <button id="joinBtn" disabled>Join call (listen)</button>
+    <button id="takeoverBtn" disabled>Take over (speak live)</button>
+    <button id="aiBtn" disabled>Hand back to AI</button>
     <p id="status"></p>
+    <p id="audioStatus" class="system"></p>
   </div>
 
   <div class="card">
-    <strong>Live transcript</strong> (text from the phone call)
+    <strong>Live transcript</strong>
     <div id="log"></div>
   </div>
 
   <script>
     const phone = document.getElementById("phone");
+    const liveMode = document.getElementById("liveMode");
     const callBtn = document.getElementById("callBtn");
+    const joinBtn = document.getElementById("joinBtn");
+    const takeoverBtn = document.getElementById("takeoverBtn");
+    const aiBtn = document.getElementById("aiBtn");
     const status = document.getElementById("status");
+    const audioStatus = document.getElementById("audioStatus");
     const log = document.getElementById("log");
+
+    let callConnectionId = null;
+    let monitorWs = null;
+    let micStream = null;
+    let micContext = null;
+    let micProcessor = null;
+    let playContext = null;
+    let nextPlayTime = 0;
     let lastCount = 0;
+
+    const SAMPLE_RATE = 16000;
+
+    function wsBase() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      return `${proto}//${location.host}`;
+    }
+
+    async function setCallMode(mode) {
+      if (!callConnectionId) return;
+      await fetch(`/api/call/${callConnectionId}/mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      if (mode === "live") {
+        await startMic();
+        audioStatus.textContent = "Live — your mic is on the phone call. Use headphones to avoid echo.";
+        audioStatus.className = "live";
+      } else {
+        stopMic();
+        audioStatus.textContent = "Listening only — AI is handling replies.";
+        audioStatus.className = "system";
+      }
+    }
+
+    function ensurePlayContext() {
+      if (!playContext) {
+        playContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+      }
+      if (playContext.state === "suspended") playContext.resume();
+      return playContext;
+    }
+
+    function playPcmChunk(arrayBuffer) {
+      const ctx = ensurePlayContext();
+      const int16 = new Int16Array(arrayBuffer);
+      if (!int16.length) return;
+
+      const floats = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) {
+        floats[i] = int16[i] / 32768;
+      }
+
+      const buffer = ctx.createBuffer(1, floats.length, SAMPLE_RATE);
+      buffer.copyToChannel(floats, 0);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+
+      const now = ctx.currentTime;
+      if (nextPlayTime < now) nextPlayTime = now;
+      source.start(nextPlayTime);
+      nextPlayTime += buffer.duration;
+    }
+
+    async function startMic() {
+      if (micStream) return;
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+      micContext = new AudioContext();
+      const source = micContext.createMediaStreamSource(micStream);
+      micProcessor = micContext.createScriptProcessor(4096, 1, 1);
+      const ratio = micContext.sampleRate / SAMPLE_RATE;
+
+      micProcessor.onaudioprocess = (event) => {
+        if (!monitorWs || monitorWs.readyState !== WebSocket.OPEN) return;
+        const input = event.inputBuffer.getChannelData(0);
+        const outLen = Math.floor(input.length / ratio);
+        const pcm = new Int16Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+          const sample = input[Math.floor(i * ratio)];
+          pcm[i] = Math.max(-32768, Math.min(32767, sample * 32768));
+        }
+        monitorWs.send(pcm.buffer);
+      };
+
+      source.connect(micProcessor);
+      micProcessor.connect(micContext.destination);
+    }
+
+    function stopMic() {
+      if (micProcessor) {
+        micProcessor.disconnect();
+        micProcessor = null;
+      }
+      if (micContext) {
+        micContext.close();
+        micContext = null;
+      }
+      if (micStream) {
+        micStream.getTracks().forEach((t) => t.stop());
+        micStream = null;
+      }
+    }
+
+    function disconnectMonitor() {
+      stopMic();
+      if (monitorWs) {
+        monitorWs.close();
+        monitorWs = null;
+      }
+      nextPlayTime = 0;
+    }
+
+    function joinMonitor() {
+      if (!callConnectionId) return;
+      disconnectMonitor();
+
+      monitorWs = new WebSocket(`${wsBase()}/monitor?callConnectionId=${callConnectionId}`);
+      monitorWs.binaryType = "arraybuffer";
+
+      monitorWs.onopen = () => {
+        audioStatus.textContent = "Connected — you can hear the phone call.";
+        joinBtn.disabled = true;
+        takeoverBtn.disabled = false;
+        aiBtn.disabled = false;
+      };
+
+      monitorWs.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) playPcmChunk(event.data);
+      };
+
+      monitorWs.onclose = () => {
+        audioStatus.textContent = "Disconnected from call audio.";
+        joinBtn.disabled = !callConnectionId;
+        takeoverBtn.disabled = true;
+        aiBtn.disabled = true;
+      };
+    }
 
     callBtn.onclick = async () => {
       status.textContent = "Dialing…";
+      disconnectMonitor();
+      callConnectionId = null;
+      joinBtn.disabled = true;
+      takeoverBtn.disabled = true;
+      aiBtn.disabled = true;
+
       const res = await fetch("/call", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ toPhone: phone.value }),
+        body: JSON.stringify({ toPhone: phone.value, liveMode: liveMode.checked }),
       });
       const data = await res.json();
-      status.textContent = data.success
-        ? `Call started (${data.callConnectionId})`
-        : `Error: ${data.error}`;
+      if (!data.success) {
+        status.textContent = `Error: ${data.error}`;
+        return;
+      }
+
+      callConnectionId = data.callConnectionId;
+      status.textContent = `Call started (${callConnectionId})`;
+      joinBtn.disabled = false;
+
+      if (data.callMode === "live") {
+        joinMonitor();
+        await setCallMode("live");
+        takeoverBtn.disabled = true;
+      }
+    };
+
+    joinBtn.onclick = () => joinMonitor();
+
+    takeoverBtn.onclick = async () => {
+      await setCallMode("live");
+    };
+
+    aiBtn.onclick = async () => {
+      await setCallMode("ai");
     };
 
     setInterval(async () => {
