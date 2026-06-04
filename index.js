@@ -41,8 +41,8 @@ const callSessions = new Map();
 const transcriptLog = [];
 const MAX_LOG = 200;
 const SAMPLE_RATE = 16000;
-const SILENCE_MS = 1200;
-const MIN_PCM_BYTES = SAMPLE_RATE * 2 * 0.4; // 0.4 sec minimum
+const SILENCE_MS = 1500;
+const MIN_PCM_BYTES = SAMPLE_RATE * 2 * 0.3; // 0.3 sec minimum
 
 const SYSTEM_PROMPT = `You are a friendly phone appointment scheduling assistant.
 Help callers book, reschedule, or cancel appointments.
@@ -161,6 +161,8 @@ async function speakOnPhone(callConnectionId, text, operationContext) {
     [{ kind: "fileSource", url: audioUrl }],
     { operationContext }
   );
+
+  scheduleListeningFallback(callConnectionId, text, operationContext);
 }
 
 async function transcribePcm(pcmBuffer) {
@@ -190,6 +192,35 @@ function wantsGoodbye(text) {
   return /\b(bye|goodbye|that's all|nothing else|no thanks|hang up)\b/i.test(text);
 }
 
+function scheduleListeningFallback(callConnectionId, text, operationContext) {
+  // If ACS PlayCompleted webhook is delayed/missed, still start listening
+  const estimatedMs = Math.min(45000, Math.max(5000, text.length * 70));
+  setTimeout(() => {
+    const s = callSessions.get(callConnectionId);
+    if (!s || s.mode !== "playing") return;
+    console.log(
+      `[${callConnectionId}] PlayCompleted fallback (${operationContext}) → listening`
+    );
+    s.mode = "listening";
+    s.audioChunks = [];
+    s.hadSpeech = false;
+  }, estimatedMs);
+}
+
+function maybeFlushSpeech(callConnectionId) {
+  const session = getSession(callConnectionId);
+  if (session.mode !== "listening" || session.isProcessing) return;
+  if (
+    session.hadSpeech &&
+    session.audioChunks.length > 0 &&
+    Date.now() - session.lastSpeechAt >= SILENCE_MS
+  ) {
+    processUserAudio(callConnectionId).catch((err) =>
+      console.error("processUserAudio:", err.message)
+    );
+  }
+}
+
 async function processUserAudio(callConnectionId) {
   const session = getSession(callConnectionId);
   if (session.isProcessing || session.mode !== "listening") return;
@@ -198,13 +229,17 @@ async function processUserAudio(callConnectionId) {
   session.audioChunks = [];
   session.hadSpeech = false;
 
-  if (pcm.length < MIN_PCM_BYTES) return;
+  if (pcm.length < MIN_PCM_BYTES) {
+    console.log(`[${callConnectionId}] Audio too short (${pcm.length} bytes), keep listening`);
+    return;
+  }
 
   session.isProcessing = true;
   session.mode = "processing";
 
   try {
     const text = await transcribePcm(pcm);
+    console.log(`[${callConnectionId}] Whisper: "${text || "(empty)"}"`);
     if (!text) {
       session.silenceRetries -= 1;
       if (session.silenceRetries > 0) {
@@ -240,15 +275,15 @@ function onAudioPacket(callConnectionId, base64, isSilent) {
   const session = getSession(callConnectionId);
   if (session.mode !== "listening" || session.isProcessing) return;
 
-  if (!isSilent) {
-    session.audioChunks.push(Buffer.from(base64, "base64"));
-    session.lastSpeechAt = Date.now();
-    session.hadSpeech = true;
-  } else if (session.hadSpeech && session.audioChunks.length > 0) {
-    if (Date.now() - session.lastSpeechAt >= SILENCE_MS) {
-      processUserAudio(callConnectionId);
-    }
-  }
+  const buf = Buffer.from(base64, "base64");
+  if (!buf.length) return;
+
+  // PSTN streams often mark speech as isSilent — record all audio while listening
+  session.audioChunks.push(buf);
+  session.lastSpeechAt = Date.now();
+  session.hadSpeech = true;
+
+  maybeFlushSpeech(callConnectionId);
 }
 
 function onMediaMessage(callConnectionId, packetData) {
@@ -273,6 +308,7 @@ function onMediaMessage(callConnectionId, packetData) {
 
 async function onPlayCompleted(callConnectionId, context) {
   const session = getSession(callConnectionId);
+  console.log(`[${callConnectionId}] PlayCompleted: ${context}`);
 
   if (context === "Goodbye") {
     await hangUp(callConnectionId);
@@ -282,6 +318,11 @@ async function onPlayCompleted(callConnectionId, context) {
   session.mode = "listening";
   session.audioChunks = [];
   session.hadSpeech = false;
+  console.log(`[${callConnectionId}] Now listening for speech…`);
+}
+
+function onPlayStarted(callConnectionId, context) {
+  console.log(`[${callConnectionId}] PlayStarted: ${context}`);
 }
 
 // --- HTTP ---
@@ -342,22 +383,35 @@ app.post("/api/callbacks/:contextId", async (req, res) => {
   const event = (Array.isArray(req.body) ? req.body : [req.body])[0];
   if (!event?.type) return;
 
-  const callConnectionId = event.data?.callConnectionId;
+  const eventData = event.data || {};
+  const callConnectionId = eventData.callConnectionId;
+  console.log("ACS callback:", event.type, callConnectionId, eventData.operationContext || "");
+
   if (!callConnectionId) return;
 
   try {
-    switch (event.type) {
-      case "Microsoft.Communication.PlayCompleted":
-        await onPlayCompleted(callConnectionId, event.data.operationContext);
-        break;
-      case "Microsoft.Communication.PlayFailed":
-        console.error("Play failed:", event.data.resultInformation);
-        await hangUp(callConnectionId);
-        break;
-      case "Microsoft.Communication.CallDisconnected":
-        callSessions.delete(callConnectionId);
-        logTranscript(callConnectionId, "system", "Call ended");
-        break;
+    const type = event.type;
+    if (
+      type === "Microsoft.Communication.PlayCompleted" ||
+      type === "Microsoft.Communication.playCompleted"
+    ) {
+      await onPlayCompleted(callConnectionId, eventData.operationContext);
+    } else if (
+      type === "Microsoft.Communication.PlayStarted" ||
+      type === "Microsoft.Communication.playStarted"
+    ) {
+      onPlayStarted(callConnectionId, eventData.operationContext);
+    } else if (
+      type === "Microsoft.Communication.PlayFailed" ||
+      type === "Microsoft.Communication.playFailed"
+    ) {
+      console.error("Play failed:", eventData.resultInformation);
+      const session = getSession(callConnectionId);
+      session.mode = "listening";
+      session.audioChunks = [];
+    } else if (type === "Microsoft.Communication.CallDisconnected") {
+      callSessions.delete(callConnectionId);
+      logTranscript(callConnectionId, "system", "Call ended");
     }
   } catch (err) {
     console.error("Callback error:", err.message);
